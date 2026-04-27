@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-kv-cache.h"
 
 llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
@@ -106,10 +107,146 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         ggml_tensor * Vcur = ggml_reshape_3d(ctx0, kv, n_embd_head_k, 1, n_tokens);
         cb(Vcur, "Vcur", il);
 
-        cur = build_attn(inp_attn_kv,
-                    nullptr, NULL, nullptr,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
-        cb(cur, "attn_out", il);
+        ggml_tensor * attn_out = nullptr;
+
+        const uint32_t compress_ratio = hparams.compress_ratios[il];
+        GGML_UNUSED(hparams.n_swa); // sliding window is implicit in the KV cache / topk indices
+
+        if (compress_ratio > 0 && n_tokens >= (int64_t) compress_ratio) {
+            // DeepSeek V4 Flash compressed sparse attention path
+            // TODO: for decode (n_tokens < compress_ratio), persistent compressed KV state is needed
+
+            // 1. store local KV in standard cache
+            const auto & k_idxs = inp_attn_kv->get_k_idxs();
+            const auto & v_idxs = inp_attn_kv->get_v_idxs();
+            ggml_build_forward_expand(gf, inp_attn_kv->mctx->cpy_k(ctx0, Kcur, k_idxs, il));
+            ggml_build_forward_expand(gf, inp_attn_kv->mctx->cpy_v(ctx0, Vcur, v_idxs, il));
+
+            // 2. use current batch KV as local KV (prefill path)
+            ggml_tensor * k_local = Kcur;
+            ggml_tensor * v_local = Vcur;
+
+            // 3. compute compressed KV from attention input (cur)
+            // compressor projects cur to [coff * head_dim, n_tokens]
+            const int64_t coff = compress_ratio == 4 ? 2 : 1;
+
+            ggml_tensor * kv_comp = ggml_mul_mat(ctx0, model.layers[il].attn_compressor_wkv, cur);
+            cb(kv_comp, "kv_comp", il);
+
+            ggml_tensor * score = ggml_mul_mat(ctx0, model.layers[il].attn_compressor_wgate, cur);
+            cb(score, "comp_score", il);
+
+            // add absolute position embedding
+            // ape shape: [coff * head_dim, compress_ratio]
+            // we need to tile it to [coff * head_dim, n_tokens]
+            ggml_tensor * ape = model.layers[il].attn_compressor_ape;
+            if (ape) {
+                ggml_tensor * ape_tiled = ggml_repeat(ctx0, ape, kv_comp);
+                cb(ape_tiled, "ape_tiled", il);
+                score = ggml_add(ctx0, score, ape_tiled);
+                cb(score, "comp_score_ape", il);
+            }
+
+            // reshape to [head_dim, coff, compress_ratio, n_tokens/compress_ratio] or similar
+            // For simplicity, do non-overlapping pooling: group tokens into chunks of size compress_ratio
+            ggml_tensor * kv_pooled = nullptr;
+            {
+                // kv_comp shape: [coff * head_dim, n_tokens]
+                // Reshape to [coff * head_dim, compress_ratio, n_tokens / compress_ratio]
+                const int64_t n_chunks = n_tokens / compress_ratio;
+                ggml_tensor * kv_r = ggml_reshape_3d(ctx0, kv_comp, coff * n_embd_head_k, compress_ratio, n_chunks);
+                cb(kv_r, "kv_r", il);
+
+                ggml_tensor * score_r = ggml_reshape_3d(ctx0, score, coff * n_embd_head_k, compress_ratio, n_chunks);
+                cb(score_r, "score_r", il);
+
+                // softmax over compress_ratio dimension (dim 1)
+                score_r = ggml_soft_max(ctx0, score_r);
+                cb(score_r, "score_sm", il);
+
+                // weighted sum: sum over compress_ratio dimension
+                ggml_tensor * weighted = ggml_mul(ctx0, kv_r, score_r);
+                cb(weighted, "weighted", il);
+
+                // permute so compress_ratio is dim 0, then sum_rows
+                ggml_tensor * weighted_p = ggml_permute(ctx0, weighted, 1, 0, 2, 3);
+                cb(weighted_p, "weighted_p", il);
+
+                kv_pooled = ggml_sum_rows(ctx0, weighted_p);
+                cb(kv_pooled, "kv_pooled", il);
+
+                // reshape back to [coff * head_dim, n_chunks]
+                kv_pooled = ggml_reshape_2d(ctx0, kv_pooled, coff * n_embd_head_k, n_chunks);
+                cb(kv_pooled, "kv_pooled_2d", il);
+
+                // kv_pooled is now [coff * head_dim, 1, n_chunks] -> need to collapse to [head_dim, n_chunks] for overlap
+                if (coff == 2) {
+                    // overlap mode: interleave overlapping and non-overlapping parts
+                    // For simplicity, just take the second half (normal compression)
+                    // TODO: implement proper overlap transform
+                    kv_pooled = ggml_view_2d(ctx0, kv_pooled, n_embd_head_k, n_chunks,
+                                             ggml_row_size(kv_pooled->type, coff * n_embd_head_k),
+                                             ggml_row_size(kv_pooled->type, n_embd_head_k));
+                    cb(kv_pooled, "kv_pooled_half", il);
+                } else {
+                    kv_pooled = ggml_reshape_2d(ctx0, kv_pooled, n_embd_head_k, n_chunks);
+                    cb(kv_pooled, "kv_pooled_flat", il);
+                }
+            }
+
+            // normalize
+            kv_pooled = build_norm(kv_pooled, model.layers[il].attn_compressor_norm, nullptr, LLM_NORM_RMS, il);
+            cb(kv_pooled, "kv_pooled_norm", il);
+
+            // apply compressed RoPE
+            if (n_embd_head_qk_rope > 0) {
+                ggml_tensor * k_pooled_pe = ggml_view_3d(ctx0, kv_pooled, n_embd_head_qk_rope, 1, kv_pooled->ne[1],
+                                                         ggml_row_size(kv_pooled->type, n_embd_head_k),
+                                                         ggml_row_size(kv_pooled->type, n_embd_head_k),
+                                                         ggml_row_size(kv_pooled->type, n_embd_head_qk_nope));
+                cb(k_pooled_pe, "k_pooled_pe", il);
+
+                // positions for compressed tokens: every compress_ratio-th token
+                ggml_tensor * comp_pos_f = ggml_arange(ctx0, (float)(compress_ratio - 1), (float)n_tokens, (float)compress_ratio);
+                cb(comp_pos_f, "comp_pos_f", il);
+                ggml_tensor * comp_pos = ggml_cast(ctx0, comp_pos_f, GGML_TYPE_I32);
+                cb(comp_pos, "comp_pos", il);
+
+                k_pooled_pe = ggml_rope_ext(ctx0, k_pooled_pe, comp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
+                                             hparams.rope_freq_base_compress, freq_scale,
+                                             ext_factor, attn_factor, beta_fast, beta_slow);
+                cb(k_pooled_pe, "k_pooled_pe_rope", il);
+            }
+
+            // 4. concatenate local KV + compressed KV
+            // Need to match dimensions: k_local is [head_dim, n_tokens, 1, 1] in implicit terms
+            // kv_pooled is [head_dim, n_chunks]. Expand to match.
+            ggml_tensor * kv_pooled_4d = ggml_reshape_4d(ctx0, kv_pooled, kv_pooled->ne[0], kv_pooled->ne[1], 1, 1);
+            cb(kv_pooled_4d, "kv_pooled_4d", il);
+
+            ggml_tensor * k_cat = ggml_concat(ctx0, k_local, kv_pooled_4d, 1);
+            cb(k_cat, "k_cat", il);
+            ggml_tensor * v_cat = ggml_concat(ctx0, v_local, kv_pooled_4d, 1);
+            cb(v_cat, "v_cat", il);
+
+            // 5. build topk indices (simplified: attend to all local + all compressed)
+            // For now, just use standard attention on the concatenated KV
+            // TODO: implement indexer top-k selection for ratio 4 layers
+            const auto & kq_mask = inp_attn_kv->get_kq_mask();
+
+            attn_out = build_attn_mha(Qcur, k_cat, v_cat, nullptr, kq_mask,
+                                      model.layers[il].attn_sinks, nullptr, kq_scale, il);
+            cb(attn_out, "attn_out_sparse", il);
+        } else {
+            // Standard attention path (pure SWA or decode without compression)
+            attn_out = build_attn(inp_attn_kv,
+                        nullptr, NULL, nullptr,
+                        Qcur, Kcur, Vcur, nullptr,
+                        model.layers[il].attn_sinks, nullptr, kq_scale, il);
+            cb(attn_out, "attn_out", il);
+        }
+
+        cur = attn_out;
 
         // V4: low-rank grouped output projection
         if (model.layers[il].attn_o_a && model.layers[il].attn_o_b) {

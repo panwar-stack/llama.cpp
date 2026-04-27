@@ -2068,6 +2068,36 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_sparse_attn(
+         ggml_tensor * q,
+         ggml_tensor * k,
+         ggml_tensor * v,
+         ggml_tensor * mask,
+         ggml_tensor * topk,
+         ggml_tensor * sinks,
+               float   kq_scale,
+                 int   il) const {
+    const auto n_stream = k->ne[3];
+
+    // q, k, v are expected in [n_embd_head, n_head, n_tokens, n_stream] layout
+    // ggml_sparse_attn expects permuted layout: [n_embd_head, n_tokens, n_head, n_stream]
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    ggml_tensor * cur = ggml_sparse_attn(ctx0, q, k, v, mask, topk, sinks, kq_scale,
+                                          hparams.f_max_alibi_bias,
+                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    cb(cur, "sparse_attn", il);
+
+    cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+    cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 

@@ -904,6 +904,16 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    ggml_tensor * build_sparse_attn(
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_kv]
+            ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_kv]
+            ggml_tensor * mask,    // [n_topk, n_tokens, 1, n_stream]
+            ggml_tensor * topk,    // [n_topk, n_tokens, n_head_q, n_stream] I32
+            ggml_tensor * sinks,   // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(

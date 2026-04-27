@@ -126,6 +126,8 @@ Deliverable:
 
 - DeepSeek4 attention matches the reference architecture for compressed and uncompressed layers
 
+Cross check with the math here Huggingface reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main and the paper https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf
+
 ## Phase 3: Implement Hash-Routed MoE for First `num_hash_layers`
 
 Goal: support the first 3 Flash layers that use token-id-based routing.
@@ -144,6 +146,8 @@ Tasks:
 Deliverable:
 
 - Early Flash MoE layers behave like the official model instead of dense FFN or standard routed MoE
+
+Cross check with the math here Huggingface reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main and the paper https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf
 
 ## Phase 4: Implement Hyper-Connections
 
@@ -167,6 +171,8 @@ Deliverable:
 
 - DeepSeek4 residual flow matches the reference HC architecture
 
+Cross check with the math here Huggingface reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main and the paper https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf
+
 ## Phase 5: Implement MTP / NextN
 
 Goal: support the extra NextN prediction layer used by Flash.
@@ -185,6 +191,8 @@ Tasks:
 Deliverable:
 
 - Full Flash checkpoint layout is represented and executable, including the MTP layer
+
+Cross check with the math here Huggingface reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main and the paper https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf
 
 ## Phase 6: Validation and Regression Tests
 
@@ -213,6 +221,8 @@ Regression coverage:
 Deliverable:
 
 - Logit parity confidence and automated regression protection
+
+Cross check with the math here Huggingface reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main and the paper https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf
 
 ## Recommended Execution Order
 
