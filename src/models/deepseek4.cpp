@@ -289,19 +289,46 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
-                model.layers[il].ffn_exp_probs_b,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, hparams.expert_weights_norm,
-                hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il,
-                nullptr,
-                model.layers[il].ffn_gate_up_exps);
+            ggml_tensor * moe_out = nullptr;
+
+            if ((uint32_t) il < hparams.n_hash_layers && model.layers[il].ffn_gate_tid2eid && res->t_inp_tokens) {
+                // Hash-routed MoE: token-id -> expert-id lookup (DeepSeek-V4 Flash)
+                ggml_tensor * selected_experts = ggml_get_rows(ctx0, model.layers[il].ffn_gate_tid2eid, res->t_inp_tokens);
+                cb(selected_experts, "ffn_moe_hash_topk", il);
+
+                moe_out = build_moe_ffn(cur,
+                    nullptr,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    model.layers[il].ffn_gate_up_exps,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    selected_experts);
+            } else {
+                // Score-based routed MoE
+                moe_out = build_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    model.layers[il].ffn_gate_up_exps);
+            }
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert
