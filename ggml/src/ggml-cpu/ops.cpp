@@ -8894,6 +8894,193 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+// ggml_compute_forward_sparse_attn
+
+static void ggml_compute_forward_sparse_attn_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * topk = dst->src[4];
+    const ggml_tensor * sinks = dst->src[5];
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t D      = q->ne[0];
+    const int64_t nq     = q->ne[1];
+    const int64_t n_head = q->ne[2];
+    const int64_t n_stream = q->ne[3];
+
+    const int64_t n_kv   = k->ne[1];
+    const int64_t n_topk = topk->ne[0];
+
+    GGML_ASSERT(k->ne[0] == D);
+    GGML_ASSERT(v->ne[0] == D);
+    GGML_ASSERT(v->ne[1] == n_kv);
+    GGML_ASSERT(topk->ne[1] == nq);
+    GGML_ASSERT(topk->ne[2] == n_head);
+    GGML_ASSERT(topk->ne[3] == n_stream);
+
+    const size_t nbq0 = q->nb[0];
+    const size_t nbq1 = q->nb[1];
+    const size_t nbq2 = q->nb[2];
+    const size_t nbq3 = q->nb[3];
+
+    const size_t nbk0 = k->nb[0];
+    const size_t nbk1 = k->nb[1];
+    const size_t nbk2 = k->nb[2];
+    const size_t nbk3 = k->nb[3];
+
+    const size_t nbv0 = v->nb[0];
+    const size_t nbv1 = v->nb[1];
+    const size_t nbv2 = v->nb[2];
+    const size_t nbv3 = v->nb[3];
+
+    const size_t nbt0 = topk->nb[0];
+    const size_t nbt1 = topk->nb[1];
+    const size_t nbt2 = topk->nb[2];
+    const size_t nbt3 = topk->nb[3];
+
+    const size_t nbd0 = dst->nb[0];
+    const size_t nbd1 = dst->nb[1];
+    const size_t nbd2 = dst->nb[2];
+    const size_t nbd3 = dst->nb[3];
+
+    const bool use_f16_mask = mask && mask->type == GGML_TYPE_F16;
+    const size_t nb_m0 = mask ? mask->nb[0] : 0;
+    const size_t nb_m1 = mask ? mask->nb[1] : 0;
+    const size_t nb_m2 = mask ? mask->nb[2] : 0;
+    const size_t nb_m3 = mask ? mask->nb[3] : 0;
+
+    const float * sk = sinks ? (float *) sinks->data : nullptr;
+
+    // parallelize over (stream, head, query) combinations
+    const int64_t n_tasks = n_stream * n_head * nq;
+    const int64_t dr = (n_tasks + nth - 1) / nth;
+    const int64_t task0 = dr * ith;
+    const int64_t task1 = MIN(task0 + dr, n_tasks);
+
+    std::vector<float> vk_buf(n_topk * D);
+    std::vector<float> kq_buf(n_topk);
+
+    for (int64_t task = task0; task < task1; ++task) {
+        const int64_t i03 = task / (n_head * nq);
+        const int64_t rem = task % (n_head * nq);
+        const int64_t i02 = rem / nq;
+        const int64_t i01 = rem % nq;
+
+        const float * qp = (float *)((char *) q->data + i01*nbq1 + i02*nbq2 + i03*nbq3);
+        float       * dp = (float *)((char *) dst->data + i01*nbd1 + i02*nbd2 + i03*nbd3);
+
+        // gather V and K for this query according to topk indices
+        const int32_t * tp = (int32_t *)((char *) topk->data + i01*nbt1 + i02*nbt2 + i03*nbt3);
+
+        for (int64_t ik = 0; ik < n_topk; ++ik) {
+            int32_t idx = tp[ik];
+            if (idx < 0 || idx >= (int32_t) n_kv) {
+                idx = 0; // safety clamp
+            }
+            const float * kp = (float *)((char *) k->data + idx*nbk1 + i02*nbk2 + i03*nbk3);
+            const float * vp = (float *)((char *) v->data + idx*nbv1 + i02*nbv2 + i03*nbv3);
+            for (int64_t d = 0; d < D; ++d) {
+                vk_buf[ik*D + d] = vp[d];
+            }
+            float dot = 0.0f;
+            for (int64_t d = 0; d < D; ++d) {
+                dot += qp[d] * kp[d];
+            }
+            kq_buf[ik] = dot * scale;
+        }
+
+        // apply mask
+        if (mask) {
+            const char * mp = (char *) mask->data + i01*nb_m1 + i03*nb_m3;
+            for (int64_t ik = 0; ik < n_topk; ++ik) {
+                float mv;
+                if (use_f16_mask) {
+                    mv = GGML_CPU_FP16_TO_FP32(*(ggml_fp16_t *)(mp + ik*nb_m0));
+                } else {
+                    mv = *(float *)(mp + ik*nb_m0);
+                }
+                kq_buf[ik] += mv;
+            }
+        }
+
+        // apply logit softcap
+        if (logit_softcap > 0.0f) {
+            for (int64_t ik = 0; ik < n_topk; ++ik) {
+                kq_buf[ik] = logit_softcap * tanhf(kq_buf[ik] / logit_softcap);
+            }
+        }
+
+        // softmax with sink correction
+        float max_val = -INFINITY;
+        for (int64_t ik = 0; ik < n_topk; ++ik) {
+            if (kq_buf[ik] > max_val) max_val = kq_buf[ik];
+        }
+        if (sk) {
+            max_val = MAX(max_val, sk[i02]);
+        }
+
+        float sum = 0.0f;
+        for (int64_t ik = 0; ik < n_topk; ++ik) {
+            kq_buf[ik] = expf(kq_buf[ik] - max_val);
+            sum += kq_buf[ik];
+        }
+        if (sk) {
+            sum += expf(sk[i02] - max_val);
+        }
+        sum = 1.0f / sum;
+        for (int64_t ik = 0; ik < n_topk; ++ik) {
+            kq_buf[ik] *= sum;
+        }
+
+        // compute output = kq @ V_gathered
+        for (int64_t d = 0; d < D; ++d) {
+            dp[d] = 0.0f;
+        }
+        for (int64_t ik = 0; ik < n_topk; ++ik) {
+            float w = kq_buf[ik];
+            for (int64_t d = 0; d < D; ++d) {
+                dp[d] += w * vk_buf[ik*D + d];
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_sparse_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_sparse_attn_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error: sparse_attn only supports F32");
+            }
+    }
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

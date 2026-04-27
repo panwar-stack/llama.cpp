@@ -296,12 +296,39 @@ class ModelBase:
                 return data / scale.float()
 
             def dequant_simple(weight: Tensor, scale: Tensor, block_size: Sequence[int] | None = None) -> Tensor:
-                scale = scale.float()
+                def fp8_e4m3fn_to_float(t: Tensor) -> Tensor:
+                    weight_i = t.to(torch.int16)
+                    exponent = (weight_i >> 3) & 0x0f
+                    mantissa = weight_i & 0x07
+                    exponent_f = exponent.float()
+                    mantissa_f = mantissa.float()
+                    one = torch.ones_like(mantissa_f)
+                    two = torch.full_like(mantissa_f, 2.0)
+                    seven = torch.full_like(mantissa_f, 7.0)
+                    eight = torch.full_like(mantissa_f, 8.0)
+                    min_normal = torch.full_like(mantissa_f, 2.0**-6)
+                    base = torch.full_like(exponent_f, 2.0)
+                    sign = one - two * ((weight_i & 0x80) != 0).float()
+                    return torch.where(
+                        exponent == 0,
+                        (mantissa_f / eight) * min_normal,
+                        (one + mantissa_f / eight) * torch.pow(base, exponent_f - seven),
+                    ) * sign
+
+                def fp8_e8m0_to_float(t: Tensor) -> Tensor:
+                    exponent = t.float()
+                    return torch.pow(torch.full_like(exponent, 2.0), exponent - torch.full_like(exponent, 127.0))
+
+                scale = fp8_e8m0_to_float(scale) if scale.dtype == torch.uint8 and not isinstance(scale, LazyTorchTensor) else scale.float()
+
+                if weight.dtype == torch.uint8 and not isinstance(weight, LazyTorchTensor):
+                    weight = fp8_e4m3fn_to_float(weight)
 
                 if block_size is not None:
                     dim_offset = scale.ndim - len(block_size)
                     for i, size in enumerate(block_size):
-                        scale = scale.repeat_interleave(size, dim_offset + i)
+                        dim = dim_offset + i
+                        scale = scale.repeat_interleave(size, dim, output_size=scale.shape[dim] * size)
                     # unpad the scale (e.g. when the tensor size isn't a multiple of the block size)
                     scale = scale[tuple(slice(0, size) for size in weight.shape)]
 
@@ -405,6 +432,14 @@ class ModelBase:
                         s = self.model_tensors[name]
                         self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
                         tensors_to_remove.append(name)
+                    # DeepSeek's inference/convert.py renames weight_scale_inv to scale.
+                    if name.endswith(".scale"):
+                        weight_name = name.removesuffix(".scale") + ".weight"
+                        if weight_name in self.model_tensors:
+                            w = self.model_tensors[weight_name]
+                            s = self.model_tensors[name]
+                            self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
+                            tensors_to_remove.append(name)
                     if name.endswith(".activation_scale"):  # unused
                         tensors_to_remove.append(name)
                     if name.endswith("_activation_scale"):  # Mistral-Small-4-119B-2602, unused
@@ -786,7 +821,10 @@ class ModelBase:
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            if data_torch.dtype not in (
+                torch.float16, torch.float32, torch.float64,
+                torch.int8, torch.int16, torch.int32, torch.int64,
+            ):
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -803,6 +841,12 @@ class ModelBase:
 
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
+
+                if np.issubdtype(data.dtype, np.signedinteger):
+                    shape_str = f"{{{', '.join(str(n) for n in reversed(data.shape))}}}"
+                    logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {data.dtype}, shape = {shape_str}")
+                    self.gguf_writer.add_tensor(new_name, data)
+                    continue
 
                 # Most of the codebase that takes in 1D tensors or norms only handles F32 tensors
                 if n_dims <= 1 or new_name.endswith("_norm.weight"):
@@ -9191,6 +9235,211 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("DeepseekV4ForCausalLM")
+class DeepseekV4Model(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+
+    # Phase 0 preserves the full Flash checkpoint structure. Runtime support is added in later phases.
+    skip_mtp = False
+    merge_expert = True
+
+    _nextn_eh_proj: dict[int, dict[str, Tensor]]
+    _converted_experts: list[dict[str, Tensor]] | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self._nextn_eh_proj = {}
+        self._converted_experts = None
+        self._experts = None
+
+    def set_gguf_parameters(self):
+        hparams = self.hparams
+
+        # V4 uses direct MQA (no MLA), but we still set num_key_value_heads = 1
+        hparams["num_key_value_heads"] = 1
+        hparams['rms_norm_eps'] = hparams.get('rms_norm_eps', 1e-6)
+
+        # Call TextModel.set_gguf_parameters directly to avoid DeepseekV2's MLA-specific logic.
+        # DeepSeek4 uses sqrtsoftplus, which the generic path does not know about yet.
+        scoring_func = hparams.pop("scoring_func", None)
+        try:
+            TextModel.set_gguf_parameters(self)
+        finally:
+            if scoring_func is not None:
+                hparams["scoring_func"] = scoring_func
+
+        # first_k_dense_replace: number of leading layers using dense FFN instead of MoE
+        has_moe = hparams.get("n_routed_experts") is not None
+        first_k_dense_replace = hparams.get("first_k_dense_replace")
+        if first_k_dense_replace is None:
+            first_k_dense_replace = hparams["num_hidden_layers"] if not has_moe else 0
+        self.gguf_writer.add_leading_dense_block_count(first_k_dense_replace)
+
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+
+        if "q_lora_rank" in hparams and hparams["q_lora_rank"] is not None:
+            self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+
+        # V4-specific: low-rank grouped output projection
+        if "o_lora_rank" in hparams and hparams["o_lora_rank"] is not None:
+            self.gguf_writer.add_key_value(gguf.Keys.Attention.O_LORA_RANK, hparams["o_lora_rank"])
+        if "o_groups" in hparams and hparams["o_groups"] is not None:
+            self.gguf_writer.add_key_value(gguf.Keys.Attention.OUTPUT_GROUP_COUNT, hparams["o_groups"])
+
+        if (nextn_layers := hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(nextn_layers)
+
+        if (hash_layers := hparams.get("num_hash_layers")) is not None:
+            self.gguf_writer.add_hash_layer_count(hash_layers)
+
+        if (hc_mult := hparams.get("hc_mult")) is not None:
+            self.gguf_writer.add_hc_mult(hc_mult)
+        if (hc_eps := hparams.get("hc_eps")) is not None:
+            self.gguf_writer.add_hc_eps(hc_eps)
+        if (hc_sinkhorn_iters := hparams.get("hc_sinkhorn_iters")) is not None:
+            self.gguf_writer.add_hc_sinkhorn_iters(hc_sinkhorn_iters)
+
+        if (sliding_window := hparams.get("sliding_window")) is not None:
+            self.gguf_writer.add_sliding_window(sliding_window)
+
+        if (compress_rope_theta := hparams.get("compress_rope_theta")) is not None:
+            self.gguf_writer.add_rope_freq_base_compress(compress_rope_theta)
+
+        if (compress_ratios := hparams.get("compress_ratios")) is not None:
+            ratios = list(compress_ratios)
+            if len(ratios) < self.block_count:
+                ratios.extend([0] * (self.block_count - len(ratios)))
+            self.gguf_writer.add_attention_compress_ratios(ratios)
+
+        if (index_n_heads := hparams.get("index_n_heads")) is not None:
+            self.gguf_writer.add_indexer_head_count(index_n_heads)
+        if (index_head_dim := hparams.get("index_head_dim")) is not None:
+            self.gguf_writer.add_indexer_key_length(index_head_dim)
+        if (index_topk := hparams.get("index_topk")) is not None:
+            self.gguf_writer.add_indexer_top_k(index_topk)
+
+        # MoE parameters
+        moe_intermediate_size = self.find_hparam(["moe_intermediate_size", "intermediate_size"], optional=False)
+        self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
+
+        if (n_routed_experts := hparams.get("n_routed_experts")) is not None:
+            self.gguf_writer.add_expert_count(n_routed_experts)
+
+        n_shared_experts = hparams.get("n_shared_experts", 0)
+        self.gguf_writer.add_expert_shared_count(n_shared_experts)
+
+        if (routed_scaling_factor := hparams.get("routed_scaling_factor")) is not None:
+            self.gguf_writer.add_expert_weights_scale(routed_scaling_factor)
+
+        if (norm_topk_prob := hparams.get("norm_topk_prob")) is not None and norm_topk_prob:
+            self.gguf_writer.add_expert_weights_norm(norm_topk_prob)
+
+        # V4-specific gating function
+        scoring_func = hparams.get("scoring_func", "softmax")
+        if scoring_func == "sqrtsoftplus":
+            self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SQRT_SOFTPLUS)
+        elif scoring_func == "sigmoid":
+            self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+        else:
+            self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SOFTMAX)
+
+        self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+
+        if (rope_mscale_all := self.rope_parameters.get("mscale_all_dim")) is not None:
+            self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1 * rope_mscale_all)
+
+        if "swiglu_limit" in hparams:
+            self.gguf_writer.add_swiglu_clamp_exp([hparams["swiglu_limit"]] * self.block_count)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Accept both stock HF MTP names and the layout emitted by DeepSeek's inference/convert.py.
+        mtp_match = re.match(r"(model\.)?mtp\.layers\.(\d+)\.(.+)", name)
+        if mtp_match:
+            bid = self.hparams["num_hidden_layers"] + int(mtp_match.group(2))
+            prefix = "model.layers" if mtp_match.group(1) else "layers"
+            name = f"{prefix}.{bid}.{mtp_match.group(3)}"
+
+        # DeepSeek inference format stores MTP e_proj and h_proj separately. GGUF's existing
+        # NextN schema stores them concatenated as eh_proj.
+        nextn_proj_match = re.match(r"(?:model\.)?layers\.(\d+)\.(e_proj|h_proj)\.weight$", name)
+        if nextn_proj_match:
+            nextn_bid = int(nextn_proj_match.group(1))
+            proj_kind = nextn_proj_match.group(2)
+            pending = self._nextn_eh_proj.setdefault(nextn_bid, {})
+            pending[proj_kind] = data_torch
+            if "e_proj" in pending and "h_proj" in pending:
+                merged = torch.cat([pending.pop("e_proj"), pending.pop("h_proj")], dim=0)
+                if not pending:
+                    del self._nextn_eh_proj[nextn_bid]
+                yield from super().modify_tensors(merged, f"model.layers.{nextn_bid}.eh_proj.weight", nextn_bid)
+            return
+
+        # Merge expert tensors from DeepSeek's converted inference layout:
+        # layers.N.ffn.experts.E.w{1,2,3}.weight -> layers.N.ffn.experts.w{1,2,3}.weight
+        converted_expert_match = re.match(r"(?:model\.)?layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.weight$", name)
+        if converted_expert_match:
+            layer_id = int(converted_expert_match.group(1))
+            n_experts = self.hparams["n_routed_experts"]
+
+            if self._converted_experts is None:
+                self._converted_experts = [{} for _ in range(self.block_count)]
+
+            self._converted_experts[layer_id][name] = data_torch
+
+            if len(self._converted_experts[layer_id]) >= n_experts * 3:
+                for w_name in ["w2", "w1", "w3"]:
+                    datas: list[Tensor] = []
+                    for xid in range(n_experts):
+                        ename = f"layers.{layer_id}.ffn.experts.{xid}.{w_name}.weight"
+                        model_ename = f"model.{ename}"
+                        if ename in self._converted_experts[layer_id]:
+                            datas.append(self._converted_experts[layer_id].pop(ename))
+                        else:
+                            datas.append(self._converted_experts[layer_id].pop(model_ename))
+
+                    merged_name = f"layers.{layer_id}.ffn.experts.{w_name}.weight"
+                    yield from super().modify_tensors(torch.stack(datas, dim=0), merged_name, layer_id)
+                return
+            else:
+                return
+
+        # V4 does not have kv_b_proj, so skip the MLA split logic
+        if name.endswith("kv_b_proj.weight"):
+            yield from super(TextModel, self).modify_tensors(data_torch, name, bid)
+            return
+
+        # wo_a is stored flattened in HF checkpoints but the runtime needs per-group slices.
+        if bid is not None and name.endswith(("self_attn.wo_a.weight", "self_attn.wo_a_proj.weight", ".attn.wo_a.weight")):
+            o_groups = self.hparams["o_groups"]
+            o_lora_rank = self.hparams["o_lora_rank"]
+            if data_torch.shape[0] != o_groups * o_lora_rank:
+                raise ValueError(
+                    f"Unexpected wo_a shape for layer {bid}: {tuple(data_torch.shape)} "
+                    f"(expected first dim {o_groups * o_lora_rank})"
+                )
+            data_torch = data_torch.reshape(o_groups, o_lora_rank, data_torch.shape[1])
+
+        for new_name, data_torch in super().modify_tensors(data_torch, name, bid):
+            # DeepSeek stores attn_sink as a bare parameter. Keep the established GGUF
+            # attn_sinks.weight spelling used by the runtime.
+            if bid is not None and self.match_model_tensor_name(new_name, gguf.MODEL_TENSOR.ATTN_SINKS, bid, suffix=""):
+                new_name += ".weight"
+            yield new_name, data_torch
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        if self._converted_experts is not None:
+            experts = [k for d in self._converted_experts for k in d.keys()]
+            if len(experts) > 0:
+                raise ValueError(f"Unprocessed DeepSeek-V4 converted-layout experts: {experts}")
+
+        if self._nextn_eh_proj:
+            raise ValueError(f"Unpaired DeepSeek-V4 NextN projection tensors: {self._nextn_eh_proj.keys()}")
+
+
 @ModelBase.register(
     "Mistral3ForConditionalGeneration",
     "Ministral3ForCausalLM",
@@ -13200,6 +13449,24 @@ class DotsOCRVisionModel(MmprojModel):
 ###### CONVERSION LOGIC ######
 
 
+def _optional_torch_dtype_map(*items: tuple[str, type]) -> dict[torch.dtype, type]:
+    result: dict[torch.dtype, type] = {}
+    for dtype_name, np_dtype in items:
+        torch_dtype = getattr(torch, dtype_name, None)
+        if torch_dtype is not None:
+            result[torch_dtype] = np_dtype
+    return result
+
+
+def _optional_torch_dtype_str_map(*items: tuple[str, str]) -> dict[str, torch.dtype]:
+    result: dict[str, torch.dtype] = {}
+    for safetensors_name, dtype_name in items:
+        torch_dtype = getattr(torch, dtype_name, None)
+        if torch_dtype is not None:
+            result[safetensors_name] = torch_dtype
+    return result
+
+
 # tree of lazy tensors
 class LazyTorchTensor(gguf.LazyBase):
     _tensor_type = torch.Tensor
@@ -13211,7 +13478,17 @@ class LazyTorchTensor(gguf.LazyBase):
     _dtype_map: dict[torch.dtype, type] = {
         torch.float16: np.float16,
         torch.float32: np.float32,
+        torch.int64: np.int64,
+        torch.int32: np.int32,
+        torch.int16: np.int16,
+        torch.int8: np.int8,
         torch.uint8: np.uint8,
+        torch.bool: np.bool_,
+        **_optional_torch_dtype_map(
+            ("uint64", np.uint64),
+            ("uint32", np.uint32),
+            ("uint16", np.uint16),
+        ),
     }
 
     # only used when byteswapping data. Only correct size is needed
@@ -13221,16 +13498,18 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.bfloat16: np.float16,
         torch.float16: np.float16,
         torch.int64: np.int64,
-        torch.uint64: np.uint64,
         torch.int32: np.int32,
-        torch.uint32: np.uint32,
         torch.int16: np.int16,
-        torch.uint16: np.uint16,
         torch.int8: np.int8,
         torch.uint8: np.uint8,
         torch.bool: np.uint8,
-        torch.float8_e4m3fn: np.uint8,
-        torch.float8_e5m2: np.uint8,
+        **_optional_torch_dtype_map(
+            ("uint64", np.uint64),
+            ("uint32", np.uint32),
+            ("uint16", np.uint16),
+            ("float8_e4m3fn", np.uint8),
+            ("float8_e5m2", np.uint8),
+        ),
     }
 
     # used for safetensors slices
@@ -13250,9 +13529,30 @@ class LazyTorchTensor(gguf.LazyBase):
         "U8": torch.uint8,
         "I8": torch.int8,
         "BOOL": torch.bool,
-        "F8_E4M3": torch.float8_e4m3fn,
-        "F8_E5M2": torch.float8_e5m2,
+        "F8_E4M3": getattr(torch, "float8_e4m3fn", torch.uint8),
+        "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
+        **_optional_torch_dtype_str_map(
+            ("F8_E5M2", "float8_e5m2"),
+        ),
     }
+
+    @staticmethod
+    def _fp8_e4m3fn_to_float(t: Tensor) -> Tensor:
+        weight_i = t.to(torch.int16)
+        sign = 1.0 - 2.0 * ((weight_i & 0x80) != 0).float()
+        exponent = (weight_i >> 3) & 0x0f
+        mantissa = weight_i & 0x07
+        exponent_f = exponent.float()
+        mantissa_f = mantissa.float()
+        return torch.where(
+            exponent == 0,
+            (mantissa_f / 8.0) * 2.0**-6,
+            (1.0 + mantissa_f / 8.0) * torch.pow(2.0, exponent_f - 7.0),
+        ) * sign
+
+    @staticmethod
+    def _fp8_e8m0_to_float(t: Tensor) -> Tensor:
+        return torch.pow(2.0, t.float() - 127.0)
 
     def numpy(self) -> gguf.LazyNumpyTensor:
         dtype = self._dtype_map[self.dtype]
@@ -13283,8 +13583,15 @@ class LazyTorchTensor(gguf.LazyBase):
                 return tensor
             dtype = cls._dtype_str_map[tensor.dtype]
             numpy_dtype = cls._dtype_byteswap_map[dtype]
-            return torch.from_numpy(byteswap_tensor(tensor.mmap_bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
+            data = torch.from_numpy(byteswap_tensor(tensor.mmap_bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
+            if tensor.dtype == "F8_E4M3" and dtype == torch.uint8:
+                return cls._fp8_e4m3fn_to_float(data)
+            if tensor.dtype == "F8_E8M0" and dtype == torch.uint8:
+                return cls._fp8_e8m0_to_float(data)
+            return data
         dtype = cls._dtype_str_map[t.dtype]
+        if t.dtype in {"F8_E4M3", "F8_E8M0"} and dtype == torch.uint8:
+            dtype = torch.float32
         shape = t.shape
         lazy = cls(meta=cls.meta_with_dtype_and_shape(dtype, shape), args=(t,), func=lambda r: load_tensor(r))
         return cast(torch.Tensor, lazy)
@@ -13299,8 +13606,16 @@ class LazyTorchTensor(gguf.LazyBase):
         dtype = cls._dtype_str_map[remote_tensor.dtype]
         numpy_dtype = cls._dtype_byteswap_map[dtype]
         shape = remote_tensor.shape
-        meta = cls.meta_with_dtype_and_shape(dtype, shape)
-        lazy = cls(meta=meta, args=(remote_tensor,), func=lambda r: torch.from_numpy(byteswap_tensor(np.frombuffer(r.data(), dtype=numpy_dtype), numpy_dtype)).view(dtype).reshape(shape))
+        meta_dtype = torch.float32 if remote_tensor.dtype in {"F8_E4M3", "F8_E8M0"} and dtype == torch.uint8 else dtype
+        meta = cls.meta_with_dtype_and_shape(meta_dtype, shape)
+        def load_tensor(r):
+            data = torch.from_numpy(byteswap_tensor(np.frombuffer(r.data(), dtype=numpy_dtype), numpy_dtype)).view(dtype).reshape(shape)
+            if r.dtype == "F8_E4M3" and dtype == torch.uint8:
+                return cls._fp8_e4m3fn_to_float(data)
+            if r.dtype == "F8_E8M0" and dtype == torch.uint8:
+                return cls._fp8_e8m0_to_float(data)
+            return data
+        lazy = cls(meta=meta, args=(remote_tensor,), func=load_tensor)
         return cast(torch.Tensor, lazy)
 
     @classmethod

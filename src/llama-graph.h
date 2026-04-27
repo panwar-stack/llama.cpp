@@ -846,7 +846,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -871,7 +872,8 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps_b = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts = nullptr) const;
 
     //
     // inputs
@@ -901,6 +903,16 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                  float   kq_scale,
+                    int   il) const;
+
+    ggml_tensor * build_sparse_attn(
+            ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_kv]
+            ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_kv]
+            ggml_tensor * mask,    // [n_topk, n_tokens, 1, n_stream]
+            ggml_tensor * topk,    // [n_topk, n_tokens, n_head_q, n_stream] I32
+            ggml_tensor * sinks,   // [n_head_q]
                   float   kq_scale,
                     int   il) const;
 

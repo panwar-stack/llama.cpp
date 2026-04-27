@@ -208,6 +208,9 @@ struct llama_layer_nextn {
     struct ggml_tensor * hnorm            = nullptr;
     struct ggml_tensor * shared_head_head = nullptr;
     struct ggml_tensor * shared_head_norm = nullptr;
+    struct ggml_tensor * hc_head_fn       = nullptr;
+    struct ggml_tensor * hc_head_base     = nullptr;
+    struct ggml_tensor * hc_head_scale    = nullptr;
 };
 
 struct llama_layer {
@@ -239,6 +242,8 @@ struct llama_layer {
     struct ggml_tensor * wk        = nullptr;
     struct ggml_tensor * wv        = nullptr;
     struct ggml_tensor * wo        = nullptr;
+    struct ggml_tensor * attn_o_a  = nullptr; // deepseek4
+    struct ggml_tensor * attn_o_b  = nullptr; // deepseek4
     struct ggml_tensor * wqkv      = nullptr;
     struct ggml_tensor * wq_a      = nullptr;
     struct ggml_tensor * wq_b      = nullptr;
@@ -487,6 +492,26 @@ struct llama_layer {
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
+    // DeepSeek V4 Flash
+    struct ggml_tensor * attn_compressor_ape   = nullptr;
+    struct ggml_tensor * attn_compressor_norm  = nullptr;
+    struct ggml_tensor * attn_compressor_wgate = nullptr;
+    struct ggml_tensor * attn_compressor_wkv   = nullptr;
+
+    struct ggml_tensor * indexer_compressor_ape   = nullptr;
+    struct ggml_tensor * indexer_compressor_norm  = nullptr;
+    struct ggml_tensor * indexer_compressor_wgate = nullptr;
+    struct ggml_tensor * indexer_compressor_wkv   = nullptr;
+
+    struct ggml_tensor * hc_attn_fn    = nullptr;
+    struct ggml_tensor * hc_attn_base  = nullptr;
+    struct ggml_tensor * hc_attn_scale = nullptr;
+    struct ggml_tensor * hc_ffn_fn     = nullptr;
+    struct ggml_tensor * hc_ffn_base   = nullptr;
+    struct ggml_tensor * hc_ffn_scale  = nullptr;
+
+    struct ggml_tensor * ffn_gate_tid2eid = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -549,6 +574,11 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
+
+    // DeepSeek V4 hyper-connection head
+    struct ggml_tensor * hc_head_fn   = nullptr;
+    struct ggml_tensor * hc_head_base = nullptr;
+    struct ggml_tensor * hc_head_scale= nullptr;
 
     std::vector<llama_layer> layers;
 

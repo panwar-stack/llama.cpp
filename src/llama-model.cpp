@@ -507,9 +507,11 @@ const char * llm_type_name(llm_type type) {
 
 static const char * llama_expert_gating_func_name(llama_expert_gating_func_type type) {
     switch (type) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: return "softmax";
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: return "sigmoid";
-        default:                                    return "unknown";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:        return "softmax";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:        return "sigmoid";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return "softmax_weight";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:  return "sqrtsoftplus";
+        default:                                           return "unknown";
     }
 }
 
@@ -2031,6 +2033,46 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 switch (hparams.n_layer) {
                     case 12: type = LLM_TYPE_3B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,        hparams.nextn_predict_layers, false);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_O_LORA_RANK,       hparams.n_lora_o);
+                ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, hparams.n_o_groups);
+                ml.get_key(LLM_KV_HASH_LAYER_COUNT,             hparams.n_hash_layers);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_MULT,        hparams.hc_mult);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_EPS,         hparams.hc_eps);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS, hparams.hc_sinkhorn_iters, false);
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_COMPRESS,      hparams.rope_freq_base_compress, false);
+                ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIO, hparams.compress_ratios, hparams.n_layer, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,    hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,           hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,          hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,           hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,            hparams.expert_gating_func, false);
+
+                if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
+                    hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS;
+                }
+
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_clamp_exp, hparams.n_layer, false);
+
+                if (ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul, 0.0f)) {
+                    hparams.rope_yarn_log_mul /= 0.1f;
+                }
+
+                switch (hparams.n_layer) {
+                    case 43: type = LLM_TYPE_16B; break; // DeepSeek-V4-Flash (without NextN)
+                    case 44: type = LLM_TYPE_16B; break; // DeepSeek-V4-Flash (with NextN)
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -5414,6 +5456,153 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
                     }
                 } break;
+            case LLM_ARCH_DEEPSEEK4:
+                {
+                    const int64_t n_embd_head_k = hparams.n_embd_head_k();
+                    const int64_t n_embd_head_v = hparams.n_embd_head_v();
+
+                    const int64_t q_lora_rank  = hparams.n_lora_q;
+                    const int64_t o_lora_rank  = hparams.n_lora_o;
+                    const int64_t o_groups     = hparams.n_o_groups;
+
+                    const int64_t n_ff_exp        = hparams.n_ff_exp;
+                    const int64_t n_expert_shared = hparams.n_expert_shared;
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    // output
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                    if (!output) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    // V4: hyper-connection head
+                    if (hparams.hc_mult > 0) {
+                        const int64_t hc_dim = hparams.hc_mult * n_embd;
+                        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hparams.hc_mult}, 0);
+                        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hparams.hc_mult}, 0);
+                        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+                        if (q_lora_rank > 0) {
+                            layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, 0);
+                        }
+
+                        layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        if (q_lora_rank > 0) {
+                            layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), {n_embd, q_lora_rank}, 0);
+                            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head_k}, 0);
+                        } else {
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_head * n_embd_head_k}, 0);
+                        }
+
+                        // V4: direct MQA KV projection to head_dim (no MLA)
+                        layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, n_embd_head_k}, 0);
+
+                        // V4: attn_sink
+                        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, TENSOR_NOT_REQUIRED);
+
+                        // V4: low-rank grouped output projection
+                        if (o_lora_rank > 0 && o_groups > 0) {
+                            if ((n_head * n_embd_head_v) % o_groups != 0) {
+                                throw std::runtime_error("DeepSeek-V4 grouped output projection requires head_dim * n_head to be divisible by o_groups");
+                            }
+                            layer.attn_o_a = create_tensor(tn(LLM_TENSOR_ATTN_O_A, "weight", i), {n_head * n_embd_head_v / o_groups, o_lora_rank, o_groups}, 0);
+                            layer.attn_o_b = create_tensor(tn(LLM_TENSOR_ATTN_O_B, "weight", i), {o_groups * o_lora_rank, n_embd}, 0);
+                        } else {
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, 0);
+                        }
+
+                        // V4: compressor and indexer
+                        const uint32_t compress_ratio = hparams.compress_ratios[i];
+                        if (compress_ratio > 0) {
+                            const int64_t coff = compress_ratio == 4 ? 2 : 1;
+                            layer.attn_compressor_ape   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_APE,   "weight", i), {coff * n_embd_head_k, (int64_t) compress_ratio}, 0);
+                            layer.attn_compressor_norm  = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM,  "weight", i), {n_embd_head_k}, 0);
+                            layer.attn_compressor_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * n_embd_head_k}, 0);
+                            layer.attn_compressor_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * n_embd_head_k}, 0);
+
+                            if (compress_ratio == 4) {
+                                const int64_t idx_head_dim = hparams.indexer_head_size;
+                                const int64_t idx_n_heads  = hparams.indexer_n_head;
+                                layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_k_norm_b = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "bias",   i), {idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, idx_n_heads}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd, idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, idx_n_heads * idx_head_dim}, TENSOR_NOT_REQUIRED);
+
+                                layer.indexer_compressor_ape   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,   "weight", i), {coff * idx_head_dim, (int64_t) compress_ratio}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_compressor_norm  = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_NORM,  "weight", i), {idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_compressor_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_compressor_wkv   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * idx_head_dim}, TENSOR_NOT_REQUIRED);
+                            }
+                        }
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+
+                        if ((uint32_t) i < hparams.n_layer_dense_lead) {
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                        } else {
+                            layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+
+                            if (n_expert == 0) {
+                                throw std::runtime_error("n_expert must be > 0");
+                            }
+                            if (n_expert_used == 0) {
+                                throw std::runtime_error("n_expert_used must be > 0");
+                            }
+
+                            // MoE branch
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+                            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
+
+                            // Shared expert branch
+                            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+                            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
+                            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+
+                            // V4: hash-routing tid2eid
+                            if ((uint32_t) i < hparams.n_hash_layers) {
+                                layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, TENSOR_NOT_REQUIRED);
+                            }
+                        }
+
+                        // V4: hyper-connections
+                        if (hparams.hc_mult > 0) {
+                            const int64_t mix_hc = (2 + hparams.hc_mult) * hparams.hc_mult;
+                            const int64_t hc_dim = hparams.hc_mult * n_embd;
+                            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, mix_hc}, 0);
+                            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {mix_hc}, 0);
+                            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, 0);
+                            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, mix_hc}, 0);
+                            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {mix_hc}, 0);
+                            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, 0);
+                        }
+
+                        // V4: NextN / MTP tensors
+                        if (i >= (int) (n_layer - hparams.nextn_predict_layers)) {
+                            const int64_t hc_dim = hparams.hc_mult * n_embd;
+                            layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {n_embd, 2 * n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.embed_tokens = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS, "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.enorm = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.hnorm = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.hc_head_fn    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,    "weight", i), {hc_dim, hparams.hc_mult}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.hc_head_base  = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,  "weight", i), {hparams.hc_mult}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.hc_head_scale = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE, "weight", i), {1}, TENSOR_NOT_REQUIRED);
+                        }
+                    }
+                } break;
             case LLM_ARCH_PLM:
                 {
                     const int64_t n_embd_head_qk_rope = hparams.n_rot();
@@ -8269,6 +8458,19 @@ void llama_model::print_info() const {
             LLAMA_LOG_INFO("%s: expert_gating_func    = %s\n",     __func__, llama_expert_gating_func_name((llama_expert_gating_func_type) hparams.expert_gating_func));
         }
 
+        if (arch == LLM_ARCH_DEEPSEEK4) {
+            LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
+            LLAMA_LOG_INFO("%s: n_lora_q              = %d\n",     __func__, hparams.n_lora_q);
+            LLAMA_LOG_INFO("%s: n_lora_o              = %d\n",     __func__, hparams.n_lora_o);
+            LLAMA_LOG_INFO("%s: n_o_groups            = %d\n",     __func__, hparams.n_o_groups);
+            LLAMA_LOG_INFO("%s: n_hash_layers         = %d\n",     __func__, hparams.n_hash_layers);
+            LLAMA_LOG_INFO("%s: n_ff_exp              = %d\n",     __func__, hparams.n_ff_exp);
+            LLAMA_LOG_INFO("%s: n_expert_shared       = %d\n",     __func__, hparams.n_expert_shared);
+            LLAMA_LOG_INFO("%s: expert_weights_scale  = %.1f\n",   __func__, hparams.expert_weights_scale);
+            LLAMA_LOG_INFO("%s: expert_weights_norm   = %d\n",     __func__, hparams.expert_weights_norm);
+            LLAMA_LOG_INFO("%s: expert_gating_func    = %s\n",     __func__, llama_expert_gating_func_name((llama_expert_gating_func_type) hparams.expert_gating_func));
+        }
+
         if (arch == LLM_ARCH_QWEN2MOE) {
             LLAMA_LOG_INFO("%s: n_ff_exp              = %d\n",     __func__, hparams.n_ff_exp);
             LLAMA_LOG_INFO("%s: n_ff_shexp            = %d\n",     __func__, hparams.n_ff_shexp);
@@ -8840,6 +9042,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_deepseek2>(*this, params);
             } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                llm = std::make_unique<llm_build_deepseek4>(*this, params);
+            } break;
         case LLM_ARCH_CHATGLM:
             {
                 llm = std::make_unique<llm_build_chatglm>(*this, params);
@@ -9236,6 +9442,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK2OCR:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:

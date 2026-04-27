@@ -1978,6 +1978,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
+        case GGML_OP_SPARSE_ATTN:
+            {
+                ggml_compute_forward_sparse_attn(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2353,6 +2357,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_SPARSE_ATTN:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -2908,6 +2913,10 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
+                    } break;
+                case GGML_OP_SPARSE_ATTN:
+                    {
+                        // uses thread-local stack allocations in the kernel
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

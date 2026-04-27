@@ -10,10 +10,11 @@
 #define LLAMA_MAX_EXPERTS 512 // Qwen3 Next
 
 enum llama_expert_gating_func_type {
-    LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
-    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
-    LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
-    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_NONE            = 0,
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX         = 1,
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID         = 2,
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT  = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS   = 4,
 };
 
 enum llama_swa_type {
@@ -74,6 +75,8 @@ struct llama_hparams {
 
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
+    uint32_t n_lora_o           = 0;
+    uint32_t n_o_groups         = 1;
     uint32_t n_lora_kv          = 0;
     uint32_t n_ff_exp           = 0;
     uint32_t n_ff_shexp         = 0;
@@ -206,6 +209,14 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+
+    // DeepSeek V4
+    uint32_t n_hash_layers       = 0;
+    uint32_t hc_mult             = 0;
+    float    hc_eps              = 1e-6f;
+    uint32_t hc_sinkhorn_iters   = 20;
+    float    rope_freq_base_compress = 160000.0f;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> compress_ratios;
 
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;

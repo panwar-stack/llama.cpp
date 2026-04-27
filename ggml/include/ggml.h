@@ -549,6 +549,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_SPARSE_ATTN,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2404,6 +2405,22 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // sparse attention: q, k, v are the same as flash_attn_ext
+    // topk is I32 [n_topk, n_tokens, n_heads, n_stream] - indices into k/v per query
+    // mask is optional F32/F16 [n_topk, n_tokens, 1, n_stream]
+    // sinks is optional F32 [n_heads]
+    GGML_API struct ggml_tensor * ggml_sparse_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * topk,
+            struct ggml_tensor  * sinks,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
