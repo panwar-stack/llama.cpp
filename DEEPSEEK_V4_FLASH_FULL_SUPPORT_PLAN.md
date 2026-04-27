@@ -1,6 +1,7 @@
 # DeepSeek V4 Flash Full Support Plan
 
 This plan covers the remaining work to support the official `deepseek-ai/DeepSeek-V4-Flash` checkpoint end to end in `llama.cpp`.
+Huggingface reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/tree/main
 
 ## Reference Checkpoint
 

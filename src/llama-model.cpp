@@ -2069,27 +2069,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     hparams.rope_yarn_log_mul /= 0.1f;
                 }
 
-                if (hparams.nextn_predict_layers > 0) {
-                    throw std::runtime_error("DeepSeek-V4 MTP / nextn layers are not supported");
-                }
-                if (hparams.n_hash_layers > 0) {
-                    throw std::runtime_error("DeepSeek-V4 hash-routed MoE layers are not supported");
-                }
-                if (hparams.hc_mult > 0) {
-                    throw std::runtime_error("DeepSeek-V4 hyper-connections are not supported");
-                }
-                if (hparams.indexer_n_head > 0 || hparams.indexer_head_size > 0 || hparams.indexer_top_k > 0) {
-                    throw std::runtime_error("DeepSeek-V4 compressed-attention indexer is not supported");
-                }
-                if (std::any_of(
-                        hparams.compress_ratios.begin(),
-                        hparams.compress_ratios.begin() + hparams.n_layer,
-                        [](uint32_t ratio) { return ratio != 0; })) {
-                    throw std::runtime_error("DeepSeek-V4 compressed sparse attention is not supported");
-                }
-
                 switch (hparams.n_layer) {
-                    case 43: type = LLM_TYPE_16B; break; // DeepSeek-V4-Flash
+                    case 43: type = LLM_TYPE_16B; break; // DeepSeek-V4-Flash (without NextN)
+                    case 44: type = LLM_TYPE_16B; break; // DeepSeek-V4-Flash (with NextN)
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -5494,6 +5476,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
                     }
 
+                    // V4: hyper-connection head
+                    if (hparams.hc_mult > 0) {
+                        const int64_t hc_dim = hparams.hc_mult * n_embd;
+                        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hparams.hc_mult}, 0);
+                        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hparams.hc_mult}, 0);
+                        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+                    }
+
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
 
@@ -5514,6 +5504,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         // V4: direct MQA KV projection to head_dim (no MLA)
                         layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, n_embd_head_k}, 0);
 
+                        // V4: attn_sink
+                        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, TENSOR_NOT_REQUIRED);
+
                         // V4: low-rank grouped output projection
                         if (o_lora_rank > 0 && o_groups > 0) {
                             if ((n_head * n_embd_head_v) % o_groups != 0) {
@@ -5523,6 +5516,31 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.attn_o_b = create_tensor(tn(LLM_TENSOR_ATTN_O_B, "weight", i), {o_groups * o_lora_rank, n_embd}, 0);
                         } else {
                             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, 0);
+                        }
+
+                        // V4: compressor and indexer
+                        const uint32_t compress_ratio = hparams.compress_ratios[i];
+                        if (compress_ratio > 0) {
+                            const int64_t coff = compress_ratio == 4 ? 2 : 1;
+                            layer.attn_compressor_ape   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_APE,   "weight", i), {coff * n_embd_head_k, (int64_t) compress_ratio}, 0);
+                            layer.attn_compressor_norm  = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM,  "weight", i), {n_embd_head_k}, 0);
+                            layer.attn_compressor_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * n_embd_head_k}, 0);
+                            layer.attn_compressor_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * n_embd_head_k}, 0);
+
+                            if (compress_ratio == 4) {
+                                const int64_t idx_head_dim = hparams.indexer_head_size;
+                                const int64_t idx_n_heads  = hparams.indexer_n_head;
+                                layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_k_norm_b = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "bias",   i), {idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, idx_n_heads}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd, idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, idx_n_heads * idx_head_dim}, TENSOR_NOT_REQUIRED);
+
+                                layer.indexer_compressor_ape   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,   "weight", i), {coff * idx_head_dim, (int64_t) compress_ratio}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_compressor_norm  = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_NORM,  "weight", i), {idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_compressor_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * idx_head_dim}, TENSOR_NOT_REQUIRED);
+                                layer.indexer_compressor_wkv   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * idx_head_dim}, TENSOR_NOT_REQUIRED);
+                            }
                         }
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
@@ -5550,6 +5568,37 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
                             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
                             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+
+                            // V4: hash-routing tid2eid
+                            if ((uint32_t) i < hparams.n_hash_layers) {
+                                layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, TENSOR_NOT_REQUIRED);
+                            }
+                        }
+
+                        // V4: hyper-connections
+                        if (hparams.hc_mult > 0) {
+                            const int64_t mix_hc = (2 + hparams.hc_mult) * hparams.hc_mult;
+                            const int64_t hc_dim = hparams.hc_mult * n_embd;
+                            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, mix_hc}, 0);
+                            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {mix_hc}, 0);
+                            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, 0);
+                            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, mix_hc}, 0);
+                            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {mix_hc}, 0);
+                            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, 0);
+                        }
+
+                        // V4: NextN / MTP tensors
+                        if (i >= (int) (n_layer - hparams.nextn_predict_layers)) {
+                            const int64_t hc_dim = hparams.hc_mult * n_embd;
+                            layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {n_embd, 2 * n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.embed_tokens = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS, "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.enorm = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.hnorm = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.hc_head_fn    = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_FN,    "weight", i), {hc_dim, hparams.hc_mult}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.hc_head_base  = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_BASE,  "weight", i), {hparams.hc_mult}, TENSOR_NOT_REQUIRED);
+                            layer.nextn.hc_head_scale = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_SCALE, "weight", i), {1}, TENSOR_NOT_REQUIRED);
                         }
                     }
                 } break;
