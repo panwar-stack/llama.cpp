@@ -9195,12 +9195,65 @@ class DeepseekV2Model(TextModel):
 class DeepseekV4Model(DeepseekV2Model):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK4
 
-    # TODO: add support for MTP, hyper-connections, KV compression, hash routing
+    # Only the plain-attention/plain-MoE subset is supported for now.
     skip_mtp = True
     merge_expert = True
 
+    def _collect_unsupported_features(self) -> list[str]:
+        hparams = self.hparams
+        unsupported: list[str] = []
+
+        if (nextn_layers := hparams.get("num_nextn_predict_layers", 0)) > 0:
+            unsupported.append(f"MTP layers (num_nextn_predict_layers={nextn_layers})")
+
+        if (hash_layers := hparams.get("num_hash_layers", 0)) > 0:
+            unsupported.append(f"hash-routed MoE layers (num_hash_layers={hash_layers})")
+
+        if (hc_mult := hparams.get("hc_mult", 0)) > 0:
+            unsupported.append(f"hyper-connections (hc_mult={hc_mult})")
+
+        compress_ratios = hparams.get("compress_ratios") or []
+        if any(compress_ratios):
+            unsupported.append(f"compressed sparse attention (compress_ratios={compress_ratios})")
+
+        indexer = {
+            "index_n_heads": hparams.get("index_n_heads", 0),
+            "index_head_dim": hparams.get("index_head_dim", 0),
+            "index_topk": hparams.get("index_topk", 0),
+        }
+        if any(indexer.values()):
+            unsupported.append(f"compressed-attention indexer ({indexer})")
+
+        unsupported_tensor_patterns = (
+            ".self_attn.attn_sink",
+            ".self_attn.compressor.",
+            ".self_attn.indexer.",
+            ".mlp.gate.tid2eid",
+            ".hc_attn_",
+            ".hc_ffn_",
+            ".hc_head_",
+        )
+        unsupported_tensors = [
+            name for name in self.model_tensors
+            if any(pattern in name for pattern in unsupported_tensor_patterns)
+        ]
+        if unsupported_tensors:
+            preview = ", ".join(sorted(unsupported_tensors)[:3])
+            if len(unsupported_tensors) > 3:
+                preview += ", ..."
+            unsupported.append(f"unsupported tensors present ({preview})")
+
+        return unsupported
+
     def set_gguf_parameters(self):
         hparams = self.hparams
+
+        if unsupported := self._collect_unsupported_features():
+            summary = "; ".join(unsupported)
+            raise NotImplementedError(
+                "DeepSeek-V4 conversion currently supports only the plain-attention/plain-MoE subset. "
+                f"This checkpoint uses unsupported features: {summary}"
+            )
 
         # V4 uses direct MQA (no MLA), but we still set num_key_value_heads = 1
         hparams["num_key_value_heads"] = 1
@@ -9262,23 +9315,6 @@ class DeepseekV4Model(DeepseekV2Model):
         if (rope_mscale_all := self.rope_parameters.get("mscale_all_dim")) is not None:
             self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1 * rope_mscale_all)
 
-        # V4-specific parameters
-        if "compress_rope_theta" in hparams:
-            self.gguf_writer.add_key_value(gguf.Keys.Rope.FREQ_BASE_COMPRESS, hparams["compress_rope_theta"])
-        if "compress_ratios" in hparams:
-            self.gguf_writer.add_key_value(gguf.Keys.Attention.COMPRESS_RATIO, hparams["compress_ratios"])
-        if "num_hash_layers" in hparams:
-            self.gguf_writer.add_key_value(gguf.Keys.LLM.HASH_LAYER_COUNT, hparams["num_hash_layers"])
-        if "index_head_dim" in hparams:
-            self.gguf_writer.add_key_value(gguf.Keys.Attention.Indexer.KEY_LENGTH, hparams["index_head_dim"])
-        if "index_n_heads" in hparams:
-            self.gguf_writer.add_key_value(gguf.Keys.Attention.Indexer.HEAD_COUNT, hparams["index_n_heads"])
-        if "index_topk" in hparams:
-            self.gguf_writer.add_key_value(gguf.Keys.Attention.Indexer.TOP_K, hparams["index_topk"])
-        if "hc_mult" in hparams:
-            self.gguf_writer.add_key_value(gguf.Keys.LLM.HC_MULT, hparams["hc_mult"])
-        if "hc_eps" in hparams:
-            self.gguf_writer.add_key_value(gguf.Keys.LLM.HC_EPS, hparams["hc_eps"])
         if "swiglu_limit" in hparams:
             self.gguf_writer.add_key_value(gguf.Keys.LLM.SWIGLU_CLAMP_EXP, [hparams["swiglu_limit"]] * hparams["num_hidden_layers"])
 
@@ -9294,6 +9330,17 @@ class DeepseekV4Model(DeepseekV2Model):
         if name.endswith("kv_b_proj.weight"):
             yield from super(TextModel, self).modify_tensors(data_torch, name, bid)
             return
+
+        # wo_a is stored flattened in HF checkpoints but the runtime needs per-group slices.
+        if bid is not None and name.endswith(("self_attn.wo_a.weight", "self_attn.wo_a_proj.weight")):
+            o_groups = self.hparams["o_groups"]
+            o_lora_rank = self.hparams["o_lora_rank"]
+            if data_torch.shape[0] != o_groups * o_lora_rank:
+                raise ValueError(
+                    f"Unexpected wo_a shape for layer {bid}: {tuple(data_torch.shape)} "
+                    f"(expected first dim {o_groups * o_lora_rank})"
+                )
+            data_torch = data_torch.reshape(o_groups, o_lora_rank, data_torch.shape[1])
 
         yield from super().modify_tensors(data_torch, name, bid)
 

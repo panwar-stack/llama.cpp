@@ -331,11 +331,11 @@ class TensorNameMap:
 
         # Attention low-rank output (deepseek4)
         MODEL_TENSOR.ATTN_O_A: (
-            "model.layers.{bid}.self_attn.wo_a_proj", # deepseek4
+            "model.layers.{bid}.self_attn.wo_a", # deepseek4
         ),
 
         MODEL_TENSOR.ATTN_O_B: (
-            "model.layers.{bid}.self_attn.wo_b_proj", # deepseek4
+            "model.layers.{bid}.self_attn.wo_b", # deepseek4
         ),
 
         # Attention output norm
@@ -1102,11 +1102,13 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_Q_A_NORM: (
             "model.layers.{bid}.self_attn.q_a_layernorm", # deepseek2
+            "model.layers.{bid}.self_attn.q_norm",        # deepseek4
             "layers.{bid}.attention.q_a_norm",            # mistral-large
         ),
 
         MODEL_TENSOR.ATTN_KV_A_NORM: (
             "model.layers.{bid}.self_attn.kv_a_layernorm", # deepseek2
+            "model.layers.{bid}.self_attn.kv_norm",        # deepseek4
             "layers.{bid}.attention.kv_a_norm",            # mistral-large
         ),
 

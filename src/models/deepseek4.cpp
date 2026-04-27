@@ -9,6 +9,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     const int64_t n_embd_head_qk_nope = n_embd_head_k - n_embd_head_qk_rope;
 
     const int64_t q_lora_rank  = hparams.n_lora_q;
+    const int64_t o_lora_rank  = hparams.n_lora_o;
     const int64_t o_groups     = hparams.n_o_groups;
 
     // Pre-scale kq_scale and attn_factor to make the YaRN RoPE work correctly.
@@ -116,21 +117,16 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * o_grouped = ggml_reshape_3d(ctx0, cur, n_head * n_embd_head_v / o_groups, o_groups, n_tokens);
             cb(o_grouped, "o_grouped", il);
 
-            // Apply wo_a: [n_head*head_dim/o_groups, o_groups*o_lora_rank] x [n_head*head_dim/o_groups, o_groups, n_tokens]
-            // -> [o_groups*o_lora_rank, o_groups, n_tokens]
+            // Apply the per-group low-rank projection from the reference implementation:
+            // o = einsum("bsgd,grd->bsgr", o, wo_a); x = wo_b(o.flatten(2))
             ggml_tensor * o_mid = ggml_mul_mat(ctx0, model.layers[il].attn_o_a, o_grouped);
             cb(o_mid, "attn_o_a", il);
 
-            // Apply wo_b: [o_groups*o_lora_rank, n_embd] x [o_groups*o_lora_rank, o_groups, n_tokens]
-            // -> [n_embd, o_groups, n_tokens]
-            ggml_tensor * o_out = ggml_mul_mat(ctx0, model.layers[il].attn_o_b, o_mid);
-            cb(o_out, "attn_o_b", il);
+            o_mid = ggml_reshape_2d(ctx0, o_mid, o_groups * o_lora_rank, n_tokens);
+            cb(o_mid, "attn_o_a_flat", il);
 
-            // Sum over groups: permute to [o_groups, n_embd, n_tokens], sum over first dim
-            o_out = ggml_cont(ctx0, ggml_permute(ctx0, o_out, 1, 0, 2, 3));
-            o_out = ggml_sum_rows(ctx0, o_out);
-            cur = ggml_reshape_2d(ctx0, o_out, n_embd, n_tokens);
-            cb(cur, "attn_o_sum", il);
+            cur = ggml_mul_mat(ctx0, model.layers[il].attn_o_b, o_mid);
+            cb(cur, "attn_o_b", il);
         } else if (model.layers[il].wo) {
             cur = ggml_mul_mat(ctx0, model.layers[il].wo, cur);
             cb(cur, "attn_wo", il);
@@ -146,8 +142,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        if ((uint32_t) il < hparams.n_layer_dense_lead || il < (int) hparams.n_hash_layers || !model.layers[il].ffn_gate_inp) {
-            // Dense FFN or hash layers without gate_inp
+        if ((uint32_t) il < hparams.n_layer_dense_lead || !model.layers[il].ffn_gate_inp) {
+            // Dense FFN
             cur = build_ffn(cur,
                 model.layers[il].ffn_up, NULL, NULL,
                 model.layers[il].ffn_gate, NULL, NULL,

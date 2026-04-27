@@ -2040,6 +2040,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,        hparams.nextn_predict_layers, false);
                 ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
                 ml.get_key(LLM_KV_ATTENTION_O_LORA_RANK,       hparams.n_lora_o);
                 ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, hparams.n_o_groups);
@@ -2066,6 +2067,25 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 if (ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul, 0.0f)) {
                     hparams.rope_yarn_log_mul /= 0.1f;
+                }
+
+                if (hparams.nextn_predict_layers > 0) {
+                    throw std::runtime_error("DeepSeek-V4 MTP / nextn layers are not supported");
+                }
+                if (hparams.n_hash_layers > 0) {
+                    throw std::runtime_error("DeepSeek-V4 hash-routed MoE layers are not supported");
+                }
+                if (hparams.hc_mult > 0) {
+                    throw std::runtime_error("DeepSeek-V4 hyper-connections are not supported");
+                }
+                if (hparams.indexer_n_head > 0 || hparams.indexer_head_size > 0 || hparams.indexer_top_k > 0) {
+                    throw std::runtime_error("DeepSeek-V4 compressed-attention indexer is not supported");
+                }
+                if (std::any_of(
+                        hparams.compress_ratios.begin(),
+                        hparams.compress_ratios.begin() + hparams.n_layer,
+                        [](uint32_t ratio) { return ratio != 0; })) {
+                    throw std::runtime_error("DeepSeek-V4 compressed sparse attention is not supported");
                 }
 
                 switch (hparams.n_layer) {
@@ -5496,7 +5516,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         // V4: low-rank grouped output projection
                         if (o_lora_rank > 0 && o_groups > 0) {
-                            layer.attn_o_a = create_tensor(tn(LLM_TENSOR_ATTN_O_A, "weight", i), {n_head * n_embd_head_v / o_groups, o_groups * o_lora_rank}, 0);
+                            if ((n_head * n_embd_head_v) % o_groups != 0) {
+                                throw std::runtime_error("DeepSeek-V4 grouped output projection requires head_dim * n_head to be divisible by o_groups");
+                            }
+                            layer.attn_o_a = create_tensor(tn(LLM_TENSOR_ATTN_O_A, "weight", i), {n_head * n_embd_head_v / o_groups, o_lora_rank, o_groups}, 0);
                             layer.attn_o_b = create_tensor(tn(LLM_TENSOR_ATTN_O_B, "weight", i), {o_groups * o_lora_rank, n_embd}, 0);
                         } else {
                             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, 0);
@@ -5504,26 +5527,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
-                        if (i < (int) hparams.n_hash_layers) {
-                            // Hash-routed layers: gate_inp may not exist
-                            layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
-
-                            if (layer.ffn_gate_inp) {
-                                // Has MoE weights
-                                layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
-                                create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
-
-                                layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
-                                layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
-                                layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
-                            } else {
-                                // Dense FFN fallback for hash layers without gate_inp
-                                layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
-                                layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
-                                layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
-                            }
-                        } else if ((uint32_t) i < hparams.n_layer_dense_lead) {
+                        if ((uint32_t) i < hparams.n_layer_dense_lead) {
                             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
                             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
                             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
