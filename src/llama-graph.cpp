@@ -1400,6 +1400,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             {
                 probs = logits; // [n_expert, n_tokens]
             } break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+            {
+                probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); // [n_expert, n_tokens]
+            } break;
         default:
             GGML_ABORT("fatal error");
     }

@@ -329,6 +329,15 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.language_expert_dense",           # cogvlm
         ),
 
+        # Attention low-rank output (deepseek4)
+        MODEL_TENSOR.ATTN_O_A: (
+            "model.layers.{bid}.self_attn.wo_a_proj", # deepseek4
+        ),
+
+        MODEL_TENSOR.ATTN_O_B: (
+            "model.layers.{bid}.self_attn.wo_b_proj", # deepseek4
+        ),
+
         # Attention output norm
         MODEL_TENSOR.ATTN_OUT_NORM: (
             "encoder.layer.{bid}.attention.output.LayerNorm",  # bert
@@ -1073,6 +1082,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_KV_A_MQA: (
             "model.layers.{bid}.self_attn.kv_a_proj_with_mqa", # deepseek2
+            "model.layers.{bid}.self_attn.wkv",                # deepseek4
             "layers.{bid}.attention.wkv_a_with_mqa",           # mistral-large
         ),
 

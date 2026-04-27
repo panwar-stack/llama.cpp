@@ -9191,6 +9191,113 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("DeepseekV4ForCausalLM")
+class DeepseekV4Model(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+
+    # TODO: add support for MTP, hyper-connections, KV compression, hash routing
+    skip_mtp = True
+    merge_expert = True
+
+    def set_gguf_parameters(self):
+        hparams = self.hparams
+
+        # V4 uses direct MQA (no MLA), but we still set num_key_value_heads = 1
+        hparams["num_key_value_heads"] = 1
+        hparams['rms_norm_eps'] = hparams.get('rms_norm_eps', 1e-6)
+
+        # Call TextModel.set_gguf_parameters directly to avoid DeepseekV2's MLA-specific logic
+        TextModel.set_gguf_parameters(self)
+
+        # first_k_dense_replace: number of leading layers using dense FFN instead of MoE
+        has_moe = hparams.get("n_routed_experts") is not None
+        first_k_dense_replace = hparams.get("first_k_dense_replace")
+        if first_k_dense_replace is None:
+            first_k_dense_replace = hparams["num_hidden_layers"] if not has_moe else 0
+        self.gguf_writer.add_leading_dense_block_count(first_k_dense_replace)
+
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+
+        if "q_lora_rank" in hparams and hparams["q_lora_rank"] is not None:
+            self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+
+        # V4: direct MQA uses head_dim for key/value length
+        if "head_dim" in hparams and hparams["head_dim"] is not None:
+            self.gguf_writer.add_key_length(hparams["head_dim"])
+            self.gguf_writer.add_value_length(hparams["head_dim"])
+
+        # V4-specific: low-rank grouped output projection
+        if "o_lora_rank" in hparams and hparams["o_lora_rank"] is not None:
+            self.gguf_writer.add_key_value(gguf.Keys.Attention.O_LORA_RANK, hparams["o_lora_rank"])
+        if "o_groups" in hparams and hparams["o_groups"] is not None:
+            self.gguf_writer.add_key_value(gguf.Keys.Attention.OUTPUT_GROUP_COUNT, hparams["o_groups"])
+
+        # MoE parameters
+        moe_intermediate_size = self.find_hparam(["moe_intermediate_size", "intermediate_size"], optional=False)
+        self.gguf_writer.add_expert_feed_forward_length(moe_intermediate_size)
+
+        if (n_routed_experts := hparams.get("n_routed_experts")) is not None:
+            self.gguf_writer.add_expert_count(n_routed_experts)
+
+        n_shared_experts = hparams.get("n_shared_experts", 0)
+        self.gguf_writer.add_expert_shared_count(n_shared_experts)
+
+        if (routed_scaling_factor := hparams.get("routed_scaling_factor")) is not None:
+            self.gguf_writer.add_expert_weights_scale(routed_scaling_factor)
+
+        if (norm_topk_prob := hparams.get("norm_topk_prob")) is not None and norm_topk_prob:
+            self.gguf_writer.add_expert_weights_norm(norm_topk_prob)
+
+        # V4-specific gating function
+        scoring_func = hparams.get("scoring_func", "softmax")
+        if scoring_func == "sqrtsoftplus":
+            self.gguf_writer.add_expert_gating_func(4)  # LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS
+        elif scoring_func == "sigmoid":
+            self.gguf_writer.add_expert_gating_func(2)
+        else:
+            self.gguf_writer.add_expert_gating_func(1)
+
+        self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+
+        if (rope_mscale_all := self.rope_parameters.get("mscale_all_dim")) is not None:
+            self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1 * rope_mscale_all)
+
+        # V4-specific parameters
+        if "compress_rope_theta" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.Rope.FREQ_BASE_COMPRESS, hparams["compress_rope_theta"])
+        if "compress_ratios" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.Attention.COMPRESS_RATIO, hparams["compress_ratios"])
+        if "num_hash_layers" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.LLM.HASH_LAYER_COUNT, hparams["num_hash_layers"])
+        if "index_head_dim" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.Attention.Indexer.KEY_LENGTH, hparams["index_head_dim"])
+        if "index_n_heads" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.Attention.Indexer.HEAD_COUNT, hparams["index_n_heads"])
+        if "index_topk" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.Attention.Indexer.TOP_K, hparams["index_topk"])
+        if "hc_mult" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.LLM.HC_MULT, hparams["hc_mult"])
+        if "hc_eps" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.LLM.HC_EPS, hparams["hc_eps"])
+        if "swiglu_limit" in hparams:
+            self.gguf_writer.add_key_value(gguf.Keys.LLM.SWIGLU_CLAMP_EXP, [hparams["swiglu_limit"]] * hparams["num_hidden_layers"])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # skip Multi-Token Prediction (MTP) layers
+        if self.skip_mtp:
+            block_count = self.hparams["num_hidden_layers"]
+            match = re.match(r"model.layers.(\d+)", name)
+            if match and int(match.group(1)) >= block_count:
+                return
+
+        # V4 does not have kv_b_proj, so skip the MLA split logic
+        if name.endswith("kv_b_proj.weight"):
+            yield from super(TextModel, self).modify_tensors(data_torch, name, bid)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register(
     "Mistral3ForConditionalGeneration",
     "Ministral3ForCausalLM",

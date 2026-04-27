@@ -150,6 +150,9 @@ class Keys:
         EMBD_LENGTH_PER_LAYER_INP         = "{arch}.embedding_length_per_layer_input"
         SWIGLU_CLAMP_EXP                  = "{arch}.swiglu_clamp_exp"
         SWIGLU_CLAMP_SHEXP                = "{arch}.swiglu_clamp_shexp"
+        HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
+        HC_MULT                           = "{arch}.hyper_connection.mult"
+        HC_EPS                            = "{arch}.hyper_connection.eps"
         DENSE_FEAT_IN_SIZE                = "{arch}.{dense}_feat_in"
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
 
@@ -166,6 +169,8 @@ class Keys:
         GROUPNORM_GROUPS             = "{arch}.attention.group_norm_groups"
         CAUSAL                       = "{arch}.attention.causal"
         Q_LORA_RANK                  = "{arch}.attention.q_lora_rank"
+        O_LORA_RANK                  = "{arch}.attention.o_lora_rank"
+        OUTPUT_GROUP_COUNT           = "{arch}.attention.output_group_count"
         KV_LORA_RANK                 = "{arch}.attention.kv_lora_rank"
         DECAY_LORA_RANK              = "{arch}.attention.decay_lora_rank"
         ICLR_LORA_RANK               = "{arch}.attention.iclr_lora_rank"
@@ -183,6 +188,7 @@ class Keys:
         SHARED_KV_LAYERS             = "{arch}.attention.shared_kv_layers"
         SLIDING_WINDOW_PATTERN       = "{arch}.attention.sliding_window_pattern"
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
+        COMPRESS_RATIO               = "{arch}.attention.layer_compress_ratio"
 
         class Indexer:
             HEAD_COUNT = "{arch}.attention.indexer.head_count"
@@ -195,6 +201,7 @@ class Keys:
         DIMENSION_SECTIONS        = "{arch}.rope.dimension_sections"
         FREQ_BASE                 = "{arch}.rope.freq_base"
         FREQ_BASE_SWA             = "{arch}.rope.freq_base_swa"
+        FREQ_BASE_COMPRESS        = "{arch}.rope.freq_base_compress"
         SCALING_TYPE              = "{arch}.rope.scaling.type"
         SCALING_FACTOR            = "{arch}.rope.scaling.factor"
         SCALING_ALPHA             = "{arch}.rope.scaling.alpha"
@@ -442,6 +449,7 @@ class MODEL_ARCH(IntEnum):
     DEEPSEEK         = auto()
     DEEPSEEK2        = auto()
     DEEPSEEK2OCR     = auto()
+    DEEPSEEK4        = auto()
     CHATGLM          = auto()
     GLM4             = auto()
     GLM4_MOE         = auto()
@@ -529,6 +537,8 @@ class MODEL_TENSOR(IntEnum):
     ATTN_V               = auto()
     ATTN_QKV             = auto()
     ATTN_OUT             = auto()
+    ATTN_O_A             = auto() # deepseek4
+    ATTN_O_B             = auto() # deepseek4
     ATTN_NORM            = auto()
     ATTN_NORM_2          = auto()
     ATTN_OUT_NORM        = auto()
@@ -928,6 +938,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DEEPSEEK:         "deepseek",
     MODEL_ARCH.DEEPSEEK2:        "deepseek2",
     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
+    MODEL_ARCH.DEEPSEEK4:        "deepseek4",
     MODEL_ARCH.CHATGLM:          "chatglm",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
@@ -2816,6 +2827,29 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
     ],
+    MODEL_ARCH.DEEPSEEK4: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV_A_MQA,
+        MODEL_TENSOR.ATTN_KV_A_NORM,
+        MODEL_TENSOR.ATTN_O_A,
+        MODEL_TENSOR.ATTN_O_B,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+    ],
     MODEL_ARCH.ERNIE4_5_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -3942,6 +3976,10 @@ MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_ROT_EMBD,
     ],
     MODEL_ARCH.DEEPSEEK2OCR: [
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.ATTN_ROT_EMBD,
+    ],
+    MODEL_ARCH.DEEPSEEK4: [
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.ATTN_ROT_EMBD,
     ],
