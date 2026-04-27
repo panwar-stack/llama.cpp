@@ -790,6 +790,9 @@ class GGUFWriter:
     def add_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
 
+    def add_attention_compress_ratios(self, ratios: Sequence[int]) -> None:
+        self.add_array(Keys.Attention.COMPRESS_RATIO.format(arch=self.arch), ratios)
+
     def add_max_alibi_bias(self, bias: float) -> None:
         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
 
@@ -852,6 +855,15 @@ class GGUFWriter:
 
     def add_swiglu_clamp_shexp(self, values: Sequence[float]) -> None:
         self.add_array(Keys.LLM.SWIGLU_CLAMP_SHEXP.format(arch=self.arch), values)
+
+    def add_hash_layer_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.HASH_LAYER_COUNT.format(arch=self.arch), count)
+
+    def add_hc_mult(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.HC_MULT.format(arch=self.arch), count)
+
+    def add_hc_eps(self, value: float) -> None:
+        self.add_float32(Keys.LLM.HC_EPS.format(arch=self.arch), value)
 
     def add_expert_group_scale(self, value: float) -> None:
         self.add_float32(Keys.LLM.EXPERT_GROUP_SCALE.format(arch=self.arch), value)
@@ -966,6 +978,9 @@ class GGUFWriter:
 
     def add_rope_freq_base(self, value: float) -> None:
         self.add_float32(Keys.Rope.FREQ_BASE.format(arch=self.arch), value)
+
+    def add_rope_freq_base_compress(self, value: float) -> None:
+        self.add_float32(Keys.Rope.FREQ_BASE_COMPRESS.format(arch=self.arch), value)
 
     def add_rope_scaling_type(self, value: RopeScalingType) -> None:
         self.add_string(Keys.Rope.SCALING_TYPE.format(arch=self.arch), value.value)

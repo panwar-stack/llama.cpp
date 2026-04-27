@@ -36,6 +36,7 @@ class TensorNameMap:
             "encoder",                                   # neobert
             "model.transformer.wte",                     # llada
             "embed_tokens",                              # qwen3-embedding
+            "embed",                                     # deepseek4 inference format
         ),
 
         # Token type embeddings
@@ -79,12 +80,25 @@ class TensorNameMap:
             "lm_head",                   # llama4
             "model.transformer.ff_out",  # llada
             "head.decoder",              # modern-bert
+            "head",                      # deepseek4 inference format
         ),
         MODEL_TENSOR.DENSE_2_OUT: (
             "dense_2_out",  # embeddinggemma
         ),
         MODEL_TENSOR.DENSE_3_OUT: (
             "dense_3_out",  # embeddinggemma
+        ),
+        MODEL_TENSOR.HC_HEAD_FN: (
+            "model.hc_head_fn", # deepseek4
+            "hc_head_fn",       # deepseek4 inference format
+        ),
+        MODEL_TENSOR.HC_HEAD_BASE: (
+            "model.hc_head_base", # deepseek4
+            "hc_head_base",       # deepseek4 inference format
+        ),
+        MODEL_TENSOR.HC_HEAD_SCALE: (
+            "model.hc_head_scale", # deepseek4
+            "hc_head_scale",       # deepseek4 inference format
         ),
         # Output norm
         MODEL_TENSOR.OUTPUT_NORM: (
@@ -332,10 +346,12 @@ class TensorNameMap:
         # Attention low-rank output (deepseek4)
         MODEL_TENSOR.ATTN_O_A: (
             "model.layers.{bid}.self_attn.wo_a", # deepseek4
+            "layers.{bid}.attn.wo_a",            # deepseek4 inference format
         ),
 
         MODEL_TENSOR.ATTN_O_B: (
             "model.layers.{bid}.self_attn.wo_b", # deepseek4
+            "layers.{bid}.attn.wo_b",            # deepseek4 inference format
         ),
 
         # Attention output norm
@@ -366,6 +382,28 @@ class TensorNameMap:
         MODEL_TENSOR.ATTN_SINKS: (
             "model.layers.{bid}.self_attn.sinks", # openai-moe
             "model.layers.{bid}.self_attn.attention_sink_bias", # mimov2
+            "model.layers.{bid}.self_attn.attn_sink", # deepseek4
+            "layers.{bid}.attn.attn_sink",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.ATTN_COMPRESSOR_APE: (
+            "model.layers.{bid}.self_attn.compressor.ape", # deepseek4
+            "layers.{bid}.attn.compressor.ape",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.ATTN_COMPRESSOR_NORM: (
+            "model.layers.{bid}.self_attn.compressor.norm", # deepseek4
+            "layers.{bid}.attn.compressor.norm",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.ATTN_COMPRESSOR_WGATE: (
+            "model.layers.{bid}.self_attn.compressor.wgate", # deepseek4
+            "layers.{bid}.attn.compressor.wgate",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.ATTN_COMPRESSOR_WKV: (
+            "model.layers.{bid}.self_attn.compressor.wkv", # deepseek4
+            "layers.{bid}.attn.compressor.wkv",            # deepseek4 inference format
         ),
 
         MODEL_TENSOR.ATTN_GATE: (
@@ -450,10 +488,18 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.gate",                 # nemotron-h-moe
             "model.layers.{bid}.moe.gate",                      # step3.5
             "model.layers.{bid}.router.proj",                   # gemma4
+            "layers.{bid}.ffn.gate",                            # deepseek4 inference format
         ),
 
         MODEL_TENSOR.FFN_GATE_INP_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert_gate", # qwen2moe
+        ),
+
+        MODEL_TENSOR.FFN_GATE_TID2EID: (
+            "model.layers.{bid}.mlp.gate.tid2eid", # deepseek4
+            "model.layers.{bid}.mlp.gate.tie2eid", # deepseek4 typo-compatible
+            "layers.{bid}.ffn.gate.tid2eid",       # deepseek4 inference format
+            "layers.{bid}.ffn.gate.tie2eid",       # deepseek4 typo-compatible
         ),
 
         MODEL_TENSOR.FFN_EXP_PROBS_B: (
@@ -467,6 +513,8 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.e_score_correction",                    # exaone-moe
             "model.layers.{bid}.block_sparse_moe.gate.e_score_correction",  # kimi
             "model.layers.{bid}.moe.router_bias",                           # step3.5 expert selection bias
+            "model.layers.{bid}.mlp.gate.bias",                             # deepseek4
+            "layers.{bid}.ffn.gate.bias",                                   # deepseek4 inference format
         ),
 
         # Feed-forward up
@@ -522,15 +570,18 @@ class TensorNameMap:
             "encoder.layers.{bid}.mlp.experts.mlp.w1",              # nomic-bert-moe
             "model.layers.{bid}.block_sparse_moe.experts.up", # smallthinker
             "model.layers.{bid}.moe.up_proj",                       # step3.5
+            "layers.{bid}.ffn.experts.w3",                          # deepseek4 inference format (merged)
         ),
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.up_proj",          # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.up_proj",         # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_experts.w3",              # deepseek4
             "model.layers.{bid}.feed_forward.shared_expert.up_proj", # llama4
             "model.layers.{bid}.feed_forward.down_proj",
             "model.layers.{bid}.mlp.shared_mlp.up_proj",             # hunyuan
             "layers.{bid}.shared_experts.w3",                        # mistral-large
+            "layers.{bid}.ffn.shared_experts.w3",                    # deepseek4 inference format
             "backbone.layers.{bid}.mixer.shared_experts.up_proj",    # nemotron-h-moe
             "model.layers.{bid}.block_sparse_moe.shared_experts.up_proj", # kimi
             "model.layers.{bid}.share_expert.up_proj",               # step3.5
@@ -574,14 +625,17 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.experts.gate_proj",        # llama4
             "model.layers.{bid}.block_sparse_moe.experts.gate",         # smallthinker
             "model.layers.{bid}.moe.gate_proj",                         # step3.5
+            "layers.{bid}.ffn.experts.w1",                               # deepseek4 inference format (merged)
         ),
 
         MODEL_TENSOR.FFN_GATE_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.gate_proj",          # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.gate_proj",         # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_experts.w1",                # deepseek4
             "model.layers.{bid}.feed_forward.shared_expert.gate_proj", # llama4
             "model.layers.{bid}.mlp.shared_mlp.gate_proj",             # hunyuan
             "layers.{bid}.shared_experts.w1",                          # mistral-large
+            "layers.{bid}.ffn.shared_experts.w1",                      # deepseek4 inference format
             "model.layers.{bid}.block_sparse_moe.shared_experts.gate_proj", # kimi
             "model.layers.{bid}.share_expert.gate_proj",               # step3.5
         ),
@@ -653,15 +707,18 @@ class TensorNameMap:
             "model.layers.{bid}.block_sparse_moe.experts.down",     # smallthinker
             "model.layers.{bid}.moe.down_proj",                     # step3.5
             "model.layers.{bid}.experts.down_proj",                 # gemma4
+            "layers.{bid}.ffn.experts.w2",                          # deepseek4 inference format (merged)
         ),
 
         MODEL_TENSOR.FFN_DOWN_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.down_proj",          # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.down_proj",         # deepseek deepseek2
+            "model.layers.{bid}.mlp.shared_experts.w2",                # deepseek4
             "model.layers.{bid}.feed_forward.shared_expert.down_proj", # llama4
             "model.layers.{bid}.shared_mlp.output_linear",             # granitemoe
             "model.layers.{bid}.mlp.shared_mlp.down_proj",             # hunyuan
             "layers.{bid}.shared_experts.w2",                          # mistral-large
+            "layers.{bid}.ffn.shared_experts.w2",                      # deepseek4 inference format
             "backbone.layers.{bid}.mixer.shared_experts.down_proj",    # nemotron-h-moe
             "model.layers.{bid}.block_sparse_moe.shared_experts.down_proj", # kimi
             "model.layers.{bid}.share_expert.down_proj",               # step3.5
@@ -1072,17 +1129,22 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_Q_A: (
             "model.layers.{bid}.self_attn.q_a_proj", # deepseek2
+            "model.layers.{bid}.self_attn.wq_a",      # deepseek4
+            "layers.{bid}.attn.wq_a",                 # deepseek4 inference format
             "layers.{bid}.attention.wq_a",           # mistral-large
         ),
 
         MODEL_TENSOR.ATTN_Q_B: (
             "model.layers.{bid}.self_attn.q_b_proj", # deepseek2
+            "model.layers.{bid}.self_attn.wq_b",      # deepseek4
+            "layers.{bid}.attn.wq_b",                 # deepseek4 inference format
             "layers.{bid}.attention.wq_b",           # mistral-large
         ),
 
         MODEL_TENSOR.ATTN_KV_A_MQA: (
             "model.layers.{bid}.self_attn.kv_a_proj_with_mqa", # deepseek2
             "model.layers.{bid}.self_attn.wkv",                # deepseek4
+            "layers.{bid}.attn.wkv",                           # deepseek4 inference format
             "layers.{bid}.attention.wkv_a_with_mqa",           # mistral-large
         ),
 
@@ -1103,12 +1165,14 @@ class TensorNameMap:
         MODEL_TENSOR.ATTN_Q_A_NORM: (
             "model.layers.{bid}.self_attn.q_a_layernorm", # deepseek2
             "model.layers.{bid}.self_attn.q_norm",        # deepseek4
+            "layers.{bid}.attn.q_norm",                   # deepseek4 inference format
             "layers.{bid}.attention.q_a_norm",            # mistral-large
         ),
 
         MODEL_TENSOR.ATTN_KV_A_NORM: (
             "model.layers.{bid}.self_attn.kv_a_layernorm", # deepseek2
             "model.layers.{bid}.self_attn.kv_norm",        # deepseek4
+            "layers.{bid}.attn.kv_norm",                   # deepseek4 inference format
             "layers.{bid}.attention.kv_a_norm",            # mistral-large
         ),
 
@@ -1252,18 +1316,72 @@ class TensorNameMap:
 
         MODEL_TENSOR.INDEXER_K_NORM: (
             "model.layers.{bid}.self_attn.indexer.k_norm", # DSA
+            "layers.{bid}.attn.indexer.k_norm",            # deepseek4 inference format
         ),
 
         MODEL_TENSOR.INDEXER_PROJ: (
             "model.layers.{bid}.self_attn.indexer.weights_proj", # DSA
+            "layers.{bid}.attn.indexer.weights_proj",            # deepseek4 inference format
         ),
 
         MODEL_TENSOR.INDEXER_ATTN_K: (
             "model.layers.{bid}.self_attn.indexer.wk", # DSA
+            "layers.{bid}.attn.indexer.wk",            # deepseek4 inference format
         ),
 
         MODEL_TENSOR.INDEXER_ATTN_Q_B: (
             "model.layers.{bid}.self_attn.indexer.wq_b", # DSA
+            "layers.{bid}.attn.indexer.wq_b",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.INDEXER_COMPRESSOR_APE: (
+            "model.layers.{bid}.self_attn.indexer.compressor.ape", # deepseek4
+            "layers.{bid}.attn.indexer.compressor.ape",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.INDEXER_COMPRESSOR_NORM: (
+            "model.layers.{bid}.self_attn.indexer.compressor.norm", # deepseek4
+            "layers.{bid}.attn.indexer.compressor.norm",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.INDEXER_COMPRESSOR_WGATE: (
+            "model.layers.{bid}.self_attn.indexer.compressor.wgate", # deepseek4
+            "layers.{bid}.attn.indexer.compressor.wgate",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.INDEXER_COMPRESSOR_WKV: (
+            "model.layers.{bid}.self_attn.indexer.compressor.wkv", # deepseek4
+            "layers.{bid}.attn.indexer.compressor.wkv",            # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.HC_ATTN_FN: (
+            "model.layers.{bid}.hc_attn_fn", # deepseek4
+            "layers.{bid}.hc_attn_fn",       # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.HC_ATTN_BASE: (
+            "model.layers.{bid}.hc_attn_base", # deepseek4
+            "layers.{bid}.hc_attn_base",       # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.HC_ATTN_SCALE: (
+            "model.layers.{bid}.hc_attn_scale", # deepseek4
+            "layers.{bid}.hc_attn_scale",       # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.HC_FFN_FN: (
+            "model.layers.{bid}.hc_ffn_fn", # deepseek4
+            "layers.{bid}.hc_ffn_fn",       # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.HC_FFN_BASE: (
+            "model.layers.{bid}.hc_ffn_base", # deepseek4
+            "layers.{bid}.hc_ffn_base",       # deepseek4 inference format
+        ),
+
+        MODEL_TENSOR.HC_FFN_SCALE: (
+            "model.layers.{bid}.hc_ffn_scale", # deepseek4
+            "layers.{bid}.hc_ffn_scale",       # deepseek4 inference format
         ),
 
         ############################################################################
@@ -2133,22 +2251,45 @@ class TensorNameMap:
 
         MODEL_TENSOR.NEXTN_EMBED_TOKENS: (
             "model.layers.{bid}.embed_tokens",
+            "model.layers.{bid}.embed",
+            "layers.{bid}.embed",
         ),
 
         MODEL_TENSOR.NEXTN_ENORM: (
             "model.layers.{bid}.enorm",
+            "layers.{bid}.enorm",
         ),
 
         MODEL_TENSOR.NEXTN_HNORM: (
             "model.layers.{bid}.hnorm",
+            "layers.{bid}.hnorm",
         ),
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD: (
             "model.layers.{bid}.shared_head.head",
+            "model.layers.{bid}.head",
+            "layers.{bid}.head",
         ),
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
+            "model.layers.{bid}.norm",
+            "layers.{bid}.norm",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_HEAD_FN: (
+            "model.layers.{bid}.hc_head_fn",
+            "layers.{bid}.hc_head_fn",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_HEAD_BASE: (
+            "model.layers.{bid}.hc_head_base",
+            "layers.{bid}.hc_head_base",
+        ),
+
+        MODEL_TENSOR.NEXTN_HC_HEAD_SCALE: (
+            "model.layers.{bid}.hc_head_scale",
+            "layers.{bid}.hc_head_scale",
         ),
     }
 
