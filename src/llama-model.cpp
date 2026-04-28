@@ -2047,6 +2047,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_HASH_LAYER_COUNT,             hparams.n_hash_layers);
                 ml.get_key(LLM_KV_HYPER_CONNECTION_MULT,        hparams.hc_mult);
                 ml.get_key(LLM_KV_HYPER_CONNECTION_EPS,         hparams.hc_eps);
+                ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS, hparams.hc_sinkhorn_iters, false);
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_COMPRESS,      hparams.rope_freq_base_compress, false);
                 ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIO, hparams.compress_ratios, hparams.n_layer, false);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);

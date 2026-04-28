@@ -214,6 +214,7 @@ struct llama_hparams {
     uint32_t n_hash_layers       = 0;
     uint32_t hc_mult             = 0;
     float    hc_eps              = 1e-6f;
+    uint32_t hc_sinkhorn_iters   = 20;
     float    rope_freq_base_compress = 160000.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> compress_ratios;
 

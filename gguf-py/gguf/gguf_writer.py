@@ -865,6 +865,9 @@ class GGUFWriter:
     def add_hc_eps(self, value: float) -> None:
         self.add_float32(Keys.LLM.HC_EPS.format(arch=self.arch), value)
 
+    def add_hc_sinkhorn_iters(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.HC_SINKHORN_ITERS.format(arch=self.arch), count)
+
     def add_expert_group_scale(self, value: float) -> None:
         self.add_float32(Keys.LLM.EXPERT_GROUP_SCALE.format(arch=self.arch), value)
 

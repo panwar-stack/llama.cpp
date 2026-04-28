@@ -1,6 +1,181 @@
 #include "models.h"
 #include "llama-kv-cache.h"
 
+static ggml_tensor * build_hc_pre(
+    ggml_context * ctx, ggml_tensor * x,
+    ggml_tensor * hc_fn, ggml_tensor * hc_base, ggml_tensor * hc_scale,
+    int hc_mult, int sinkhorn_iters, float hc_eps, float norm_eps,
+    ggml_tensor *& out_post, ggml_tensor *& out_comb) {
+
+    const int64_t n_embd_head = x->ne[0];
+    const int64_t n_tokens    = x->ne[2];
+    const int64_t hc_dim      = hc_mult * n_embd_head;
+    const int64_t mix_hc      = (2 + hc_mult) * hc_mult;
+
+    float s0 = ((float *)hc_scale->data)[0];
+    float s1 = ((float *)hc_scale->data)[1];
+    float s2 = ((float *)hc_scale->data)[2];
+
+    ggml_tensor * eps_t      = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), hc_eps);
+    ggml_tensor * norm_eps_t = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), norm_eps);
+    ggml_tensor * one_t      = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 1.0f);
+
+    ggml_tensor * x_flat = ggml_reshape_2d(ctx, x, hc_dim, n_tokens);
+
+    ggml_tensor * x_sq   = ggml_sqr(ctx, x_flat);
+    ggml_tensor * x_mean = ggml_mean(ctx, x_sq);
+    x_mean = ggml_add(ctx, x_mean, norm_eps_t);
+    ggml_tensor * x_sqrt = ggml_sqrt(ctx, x_mean);
+    ggml_tensor * rsqrt  = ggml_div(ctx, one_t, x_sqrt);
+
+    ggml_tensor * mixes = ggml_mul_mat(ctx, hc_fn, x_flat);
+    mixes = ggml_mul(ctx, mixes, rsqrt);
+
+    // pre: first hc_mult channels, sigmoid + eps
+    ggml_tensor * pre_mixes = ggml_view_2d(ctx, mixes, hc_mult, n_tokens,
+                                           ggml_row_size(mixes->type, mix_hc), 0);
+    ggml_tensor * base_pre  = ggml_view_1d(ctx, hc_base, hc_mult, 0);
+    ggml_tensor * pre = ggml_scale(ctx, pre_mixes, s0);
+    pre = ggml_add(ctx, pre, base_pre);
+    pre = ggml_sigmoid(ctx, pre);
+    pre = ggml_add(ctx, pre, eps_t);
+
+    // post: next hc_mult channels, 2 * sigmoid
+    ggml_tensor * post_mixes = ggml_view_2d(ctx, mixes, hc_mult, n_tokens,
+                                            ggml_row_size(mixes->type, mix_hc),
+                                            ggml_row_size(mixes->type, hc_mult));
+    ggml_tensor * base_post  = ggml_view_1d(ctx, hc_base, hc_mult,
+                                            ggml_row_size(hc_base->type, hc_mult));
+    ggml_tensor * post = ggml_scale(ctx, post_mixes, s1);
+    post = ggml_add(ctx, post, base_post);
+    post = ggml_sigmoid(ctx, post);
+    post = ggml_scale(ctx, post, 2.0f);
+
+    // comb: remaining hc_mult*hc_mult channels, softmax + sinkhorn
+    ggml_tensor * comb_mixes = ggml_view_2d(ctx, mixes, hc_mult * hc_mult, n_tokens,
+                                            ggml_row_size(mixes->type, mix_hc),
+                                            ggml_row_size(mixes->type, 2 * hc_mult));
+    ggml_tensor * base_comb  = ggml_view_1d(ctx, hc_base, hc_mult * hc_mult,
+                                            ggml_row_size(hc_base->type, 2 * hc_mult));
+    ggml_tensor * comb = ggml_scale(ctx, comb_mixes, s2);
+    comb = ggml_add(ctx, comb, base_comb);
+    comb = ggml_reshape_3d(ctx, comb, hc_mult, hc_mult, n_tokens);
+
+    // row-wise softmax (over cols = ne1 = hc_out) + eps
+    {
+        ggml_tensor * comb_perm = ggml_permute(ctx, comb, 1, 0, 2, 3);
+        comb_perm = ggml_soft_max(ctx, comb_perm);
+        comb_perm = ggml_add(ctx, comb_perm, eps_t);
+        comb = ggml_permute(ctx, comb_perm, 1, 0, 2, 3);
+    }
+
+    // col normalize: comb = comb / (col_sum + eps), col_sum = sum over ne0 (rows = hc_in)
+    {
+        ggml_tensor * col_sum     = ggml_sum_rows(ctx, comb);
+        ggml_tensor * col_sum_rep = ggml_repeat(ctx, col_sum, comb);
+        comb = ggml_div(ctx, comb, ggml_add(ctx, col_sum_rep, eps_t));
+    }
+
+    for (int iter = 1; iter < sinkhorn_iters; iter++) {
+        // row normalize: comb = comb / (row_sum + eps), row_sum = sum over ne1 (cols = hc_out)
+        {
+            ggml_tensor * comb_pt     = ggml_permute(ctx, comb, 1, 0, 2, 3);
+            ggml_tensor * row_sum     = ggml_sum_rows(ctx, comb_pt);
+            ggml_tensor * row_sum_rep = ggml_repeat(ctx, row_sum, comb_pt);
+            comb_pt = ggml_div(ctx, comb_pt, ggml_add(ctx, row_sum_rep, eps_t));
+            comb = ggml_permute(ctx, comb_pt, 1, 0, 2, 3);
+        }
+        // col normalize: comb = comb / (col_sum + eps), col_sum = sum over ne0 (rows = hc_in)
+        {
+            ggml_tensor * col_sum     = ggml_sum_rows(ctx, comb);
+            ggml_tensor * col_sum_rep = ggml_repeat(ctx, col_sum, comb);
+            comb = ggml_div(ctx, comb, ggml_add(ctx, col_sum_rep, eps_t));
+        }
+    }
+
+    out_post = post;
+    out_comb = comb;
+
+    // reduce: sum_i pre[i] * x[:, i, :]
+    ggml_tensor * x_3d     = ggml_reshape_3d(ctx, x_flat, n_embd_head, hc_mult, n_tokens);
+    ggml_tensor * pre_3d   = ggml_reshape_3d(ctx, pre, 1, hc_mult, n_tokens);
+    ggml_tensor * weighted = ggml_mul(ctx, x_3d, pre_3d);
+    weighted = ggml_permute(ctx, weighted, 1, 0, 2, 3);
+    ggml_tensor * result = ggml_sum_rows(ctx, weighted);
+    result = ggml_reshape_2d(ctx, result, n_embd_head, n_tokens);
+
+    return result;
+}
+
+static ggml_tensor * build_hc_post(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    ggml_tensor * residual,
+    ggml_tensor * post,
+    ggml_tensor * comb) {
+
+    const int64_t n_embd_head = x->ne[0];
+    const int64_t n_tokens    = x->ne[1];
+    const int64_t hc_mult     = residual->ne[1];
+
+    // term1 = post * x
+    ggml_tensor * post_3d = ggml_reshape_3d(ctx, post, 1, hc_mult, n_tokens);
+    ggml_tensor * x_3d    = ggml_reshape_3d(ctx, x, n_embd_head, 1, n_tokens);
+    ggml_tensor * term1   = ggml_mul(ctx, x_3d, post_3d);
+
+    // term2 = sum_i comb[:,i] * residual[:,i,:]
+    ggml_tensor * residual_p = ggml_permute(ctx, residual, 1, 0, 2, 3);
+    ggml_tensor * term2 = ggml_mul_mat(ctx, comb, residual_p);
+    term2 = ggml_permute(ctx, term2, 1, 0, 2, 3);
+
+    ggml_tensor * result = ggml_add(ctx, term1, term2);
+    return result;
+}
+
+static ggml_tensor * build_hc_head(
+    ggml_context * ctx,
+    ggml_tensor * x,
+    ggml_tensor * hc_head_fn,
+    ggml_tensor * hc_head_base,
+    ggml_tensor * hc_head_scale,
+    int hc_mult, float hc_eps, float norm_eps) {
+
+    const int64_t n_embd_head = x->ne[0];
+    const int64_t n_tokens    = x->ne[2];
+    const int64_t hc_dim      = hc_mult * n_embd_head;
+
+    float s0 = ((float *)hc_head_scale->data)[0];
+
+    ggml_tensor * eps_t      = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), hc_eps);
+    ggml_tensor * norm_eps_t = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), norm_eps);
+    ggml_tensor * one_t      = ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 1.0f);
+
+    ggml_tensor * x_flat = ggml_reshape_2d(ctx, x, hc_dim, n_tokens);
+
+    ggml_tensor * x_sq   = ggml_sqr(ctx, x_flat);
+    ggml_tensor * x_mean = ggml_mean(ctx, x_sq);
+    x_mean = ggml_add(ctx, x_mean, norm_eps_t);
+    ggml_tensor * x_sqrt = ggml_sqrt(ctx, x_mean);
+    ggml_tensor * rsqrt  = ggml_div(ctx, one_t, x_sqrt);
+
+    ggml_tensor * mixes = ggml_mul_mat(ctx, hc_head_fn, x_flat);
+    mixes = ggml_mul(ctx, mixes, rsqrt);
+
+    ggml_tensor * pre = ggml_scale(ctx, mixes, s0);
+    pre = ggml_add(ctx, pre, hc_head_base);
+    pre = ggml_sigmoid(ctx, pre);
+    pre = ggml_add(ctx, pre, eps_t);
+
+    ggml_tensor * x_3d     = ggml_reshape_3d(ctx, x_flat, n_embd_head, hc_mult, n_tokens);
+    ggml_tensor * pre_3d   = ggml_reshape_3d(ctx, pre, 1, hc_mult, n_tokens);
+    ggml_tensor * weighted = ggml_mul(ctx, x_3d, pre_3d);
+    weighted = ggml_permute(ctx, weighted, 1, 0, 2, 3);
+    ggml_tensor * result = ggml_sum_rows(ctx, weighted);
+    result = ggml_reshape_2d(ctx, result, n_embd_head, n_tokens);
+
+    return result;
+}
+
 llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
 
@@ -12,6 +187,10 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     const int64_t q_lora_rank  = hparams.n_lora_q;
     const int64_t o_lora_rank  = hparams.n_lora_o;
     const int64_t o_groups     = hparams.n_o_groups;
+
+    const int hc_mult        = (int)hparams.hc_mult;
+    const int sinkhorn_iters = (int)hparams.hc_sinkhorn_iters;
+    const float hc_eps       = hparams.hc_eps;
 
     // Pre-scale kq_scale and attn_factor to make the YaRN RoPE work correctly.
     // See https://github.com/ggml-org/llama.cpp/discussions/7416 for detailed explanation.
@@ -26,6 +205,13 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     // {n_embd, n_tokens}
     inpL = build_inp_embd(model.tok_embd);
 
+    // expand to 3D for hyper-connections: {n_embd, hc_mult, n_tokens}
+    if (hc_mult > 0) {
+        inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
+        ggml_tensor * target = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, hc_mult, n_tokens);
+        inpL = ggml_repeat(ctx0, inpL, target);
+    }
+
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
@@ -37,9 +223,19 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     for (int il = 0; il < effective_n_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 
-        // norm
-        cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+        // === Attention: norm/hc_pre ===
+        ggml_tensor * post_attn = nullptr;
+        ggml_tensor * comb_attn = nullptr;
+
+        if (hc_mult > 0) {
+            cur = build_hc_pre(ctx0, inpL, model.layers[il].hc_attn_fn, model.layers[il].hc_attn_base,
+                              model.layers[il].hc_attn_scale, hc_mult, sinkhorn_iters, hc_eps, norm_rms_eps,
+                              post_attn, comb_attn);
+            cb(cur, "hc_pre_attn", il);
+        } else {
+            cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
+        }
 
         // self_attention
         ggml_tensor * q = NULL;
@@ -235,7 +431,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             const auto & kq_mask = inp_attn_kv->get_kq_mask();
 
             attn_out = build_attn_mha(Qcur, k_cat, v_cat, nullptr, kq_mask,
-                                      model.layers[il].attn_sinks, nullptr, kq_scale, il);
+                                       model.layers[il].attn_sinks, nullptr, kq_scale, il);
             cb(attn_out, "attn_out_sparse", il);
         } else {
             // Standard attention path (pure SWA or decode without compression)
@@ -269,15 +465,35 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             cb(cur, "attn_wo", il);
         }
 
-        if (il == effective_n_layers - 1 && inp_out_ids) {
+        if (il == effective_n_layers - 1 && inp_out_ids && hc_mult == 0) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
-        cb(ffn_inp, "ffn_inp", il);
 
-        cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
+        // === Attention residual: hc_post or ggml_add ===
+        ggml_tensor * ffn_inp;
+        if (hc_mult > 0) {
+            cur = build_hc_post(ctx0, cur, inpSA, post_attn, comb_attn);
+            cb(cur, "hc_post_attn", il);
+            ffn_inp = cur;
+        } else {
+            ffn_inp = ggml_add(ctx0, cur, inpSA);
+            cb(ffn_inp, "ffn_inp", il);
+        }
+
+        // === FFN: norm/hc_pre ===
+        ggml_tensor * post_ffn = nullptr;
+        ggml_tensor * comb_ffn = nullptr;
+
+        if (hc_mult > 0) {
+            cur = build_hc_pre(ctx0, ffn_inp, model.layers[il].hc_ffn_fn, model.layers[il].hc_ffn_base,
+                              model.layers[il].hc_ffn_scale, hc_mult, sinkhorn_iters, hc_eps, norm_rms_eps,
+                              post_ffn, comb_ffn);
+            cb(cur, "hc_pre_ffn", il);
+        } else {
+            cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+            cb(cur, "ffn_norm", il);
+        }
 
         if ((uint32_t) il < hparams.n_layer_dense_lead || !model.layers[il].ffn_gate_inp) {
             // Dense FFN
@@ -345,7 +561,14 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 cb(cur, "ffn_out", il);
             }
         }
-        cur = ggml_add(ctx0, cur, ffn_inp);
+
+        // === FFN residual: hc_post or ggml_add ===
+        if (hc_mult > 0) {
+            cur = build_hc_post(ctx0, cur, ffn_inp, post_ffn, comb_ffn);
+            cb(cur, "hc_post_ffn", il);
+        } else {
+            cur = ggml_add(ctx0, cur, ffn_inp);
+        }
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
@@ -354,6 +577,13 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         inpL = cur;
     }
     cur = inpL;
+
+    // === Output: hc_head (if HC) then final norm + lm_head ===
+    if (hc_mult > 0) {
+        cur = build_hc_head(ctx0, cur, model.hc_head_fn, model.hc_head_base, model.hc_head_scale,
+                           hc_mult, hc_eps, norm_rms_eps);
+        cb(cur, "hc_head", -1);
+    }
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 

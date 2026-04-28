@@ -9271,6 +9271,8 @@ class DeepseekV4Model(DeepseekV2Model):
             self.gguf_writer.add_hc_mult(hc_mult)
         if (hc_eps := hparams.get("hc_eps")) is not None:
             self.gguf_writer.add_hc_eps(hc_eps)
+        if (hc_sinkhorn_iters := hparams.get("hc_sinkhorn_iters")) is not None:
+            self.gguf_writer.add_hc_sinkhorn_iters(hc_sinkhorn_iters)
 
         if (sliding_window := hparams.get("sliding_window")) is not None:
             self.gguf_writer.add_sliding_window(sliding_window)

@@ -197,6 +197,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_HASH_LAYER_COUNT,                  "%s.hash_layer_count"                  },
     { LLM_KV_HYPER_CONNECTION_MULT,             "%s.hyper_connection.mult"             },
     { LLM_KV_HYPER_CONNECTION_EPS,              "%s.hyper_connection.eps"              },
+    { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERS,   "%s.hyper_connection.sinkhorn_iters"   },
     { LLM_KV_POOLING_TYPE,                      "%s.pooling_type"                      },
     { LLM_KV_LOGIT_SCALE,                       "%s.logit_scale"                       },
     { LLM_KV_DECODER_START_TOKEN_ID,            "%s.decoder_start_token_id"            },

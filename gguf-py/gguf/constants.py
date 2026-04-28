@@ -153,6 +153,7 @@ class Keys:
         HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
         HC_MULT                           = "{arch}.hyper_connection.mult"
         HC_EPS                            = "{arch}.hyper_connection.eps"
+        HC_SINKHORN_ITERS                 = "{arch}.hyper_connection.sinkhorn_iters"
         DENSE_FEAT_IN_SIZE                = "{arch}.{dense}_feat_in"
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
 
