@@ -597,4 +597,252 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // MTP / NextN layers (DeepSeek V4 Flash)
+    if (hparams.nextn_predict_layers > 0) {
+        // inpL is the HC output of the last main transformer layer
+        // Build the MTP path from this point
+        ggml_tensor * mtp_inp = inpL;
+
+        for (int im = 0; im < (int)hparams.nextn_predict_layers; im++) {
+            int il = effective_n_layers + im;
+            auto & layer = model.layers[il];
+            auto & nextn = layer.nextn;
+
+            if (!nextn.eh_proj || !nextn.enorm || !nextn.hnorm || !res->t_inp_tokens) {
+                break;
+            }
+
+            // MTP pre-processing: combine hidden state from previous stage
+            // with embedding of current tokens
+            // ref: MTPBlock.forward in DeepSeek V4 Flash inference/model.py
+            //   e = self.embed(input_ids)
+            //   e = self.enorm(e)
+            //   x = self.hnorm(x)
+            //   x = self.e_proj(e).unsqueeze(2) + self.h_proj(x)
+
+            // 1. Get token embeddings
+            ggml_tensor * mtp_emb = ggml_get_rows(ctx0, model.tok_embd, res->t_inp_tokens);
+            cb(mtp_emb, "mtp_emb", il);
+            mtp_emb = build_norm(mtp_emb, nextn.enorm, NULL, LLM_NORM_RMS, il);
+            cb(mtp_emb, "mtp_enorm", il);
+
+            // 2. Apply hnorm to hidden state (HC format: {n_embd, hc_mult, n_tokens})
+            ggml_tensor * mtp_hid = build_norm(mtp_inp, nextn.hnorm, NULL, LLM_NORM_RMS, il);
+            cb(mtp_hid, "mtp_hnorm", il);
+
+            // 3. Split eh_proj into e_proj (first n_embd rows) and h_proj (last n_embd rows)
+            // eh_proj shape: {n_embd, 2 * n_embd}
+            const int64_t n_embd_row_bytes = ggml_row_size(nextn.eh_proj->type, n_embd);
+            ggml_tensor * e_proj_w = ggml_view_2d(ctx0, nextn.eh_proj, n_embd, n_embd, n_embd_row_bytes, 0);
+            cb(e_proj_w, "mtp_e_proj_w", il);
+            ggml_tensor * h_proj_w = ggml_view_2d(ctx0, nextn.eh_proj, n_embd, n_embd, n_embd_row_bytes, n_embd * n_embd_row_bytes);
+            cb(h_proj_w, "mtp_h_proj_w", il);
+
+            // 4. e_proj(e): project embedding, result {n_embd, n_tokens}
+            ggml_tensor * e_out = ggml_mul_mat(ctx0, e_proj_w, mtp_emb);
+            cb(e_out, "mtp_e_out", il);
+
+            // 5. h_proj(x): project hidden state, result {n_embd, hc_mult, n_tokens}
+            ggml_tensor * h_out = ggml_mul_mat(ctx0, h_proj_w, mtp_hid);
+            cb(h_out, "mtp_h_out", il);
+
+            // 6. Broadcast e_out to match h_out shape and add
+            // e_out: {n_embd, n_tokens} -> {n_embd, 1, n_tokens}
+            ggml_tensor * e_out_3d = ggml_reshape_3d(ctx0, e_out, n_embd, 1, n_tokens);
+            cb(e_out_3d, "mtp_e_out_3d", il);
+            e_out_3d = ggml_repeat(ctx0, e_out_3d, h_out);
+            cb(e_out_3d, "mtp_e_out_broad", il);
+
+            ggml_tensor * mtp_cur = ggml_add(ctx0, e_out_3d, h_out);
+            cb(mtp_cur, "mtp_combined", il);
+
+            // 7. Run MTP Block: attention + FFN with HC
+            ggml_tensor * mtp_inpSA = mtp_cur;
+
+            // === MTP Attention: hc_pre ===
+            ggml_tensor * post_attn = nullptr;
+            ggml_tensor * comb_attn = nullptr;
+
+            mtp_cur = build_hc_pre(ctx0, mtp_inpSA, layer.hc_attn_fn, layer.hc_attn_base,
+                                   layer.hc_attn_scale, hc_mult, sinkhorn_iters, hc_eps, norm_rms_eps,
+                                   post_attn, comb_attn);
+            cb(mtp_cur, "mtp_hc_pre_attn", il);
+
+            // MTP self_attention (same pattern as main layers)
+            ggml_tensor * mtp_q = NULL;
+
+            if (q_lora_rank > 0) {
+                mtp_q = ggml_mul_mat(ctx0, layer.wq_a, mtp_cur);
+                cb(mtp_q, "mtp_q", il);
+                mtp_q = build_norm(mtp_q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+                cb(mtp_q, "mtp_q_norm", il);
+                mtp_q = ggml_mul_mat(ctx0, layer.wq_b, mtp_q);
+                cb(mtp_q, "mtp_q_b", il);
+            } else if (layer.wq) {
+                mtp_q = ggml_mul_mat(ctx0, layer.wq, mtp_cur);
+                cb(mtp_q, "mtp_q", il);
+            }
+
+            ggml_tensor * mtp_q_nope =
+                ggml_view_3d(ctx0, mtp_q, n_embd_head_qk_nope, n_head, n_tokens,
+                             ggml_row_size(mtp_q->type, n_embd_head_k),
+                             ggml_row_size(mtp_q->type, n_embd_head_k) * n_head, 0);
+            cb(mtp_q_nope, "mtp_q_nope", il);
+
+            ggml_tensor * mtp_q_pe = ggml_view_3d(
+                ctx0, mtp_q, n_embd_head_qk_rope, n_head, n_tokens,
+                ggml_row_size(mtp_q->type, n_embd_head_k),
+                ggml_row_size(mtp_q->type, n_embd_head_k) * n_head,
+                ggml_row_size(mtp_q->type, n_embd_head_qk_nope));
+            cb(mtp_q_pe, "mtp_q_pe", il);
+
+            // MTP KV projection
+            ggml_tensor * mtp_kv = ggml_mul_mat(ctx0, layer.wkv_a_mqa, mtp_cur);
+            cb(mtp_kv, "mtp_kv", il);
+            mtp_kv = build_norm(mtp_kv, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+            cb(mtp_kv, "mtp_kv_norm", il);
+
+            ggml_tensor * mtp_k_nope = ggml_view_3d(ctx0, mtp_kv, n_embd_head_qk_nope, 1, n_tokens,
+                                                     ggml_row_size(mtp_kv->type, n_embd_head_k),
+                                                     ggml_row_size(mtp_kv->type, n_embd_head_k), 0);
+            cb(mtp_k_nope, "mtp_k_nope", il);
+
+            ggml_tensor * mtp_k_pe = ggml_view_3d(ctx0, mtp_kv, n_embd_head_qk_rope, 1, n_tokens,
+                                                   ggml_row_size(mtp_kv->type, n_embd_head_k),
+                                                   ggml_row_size(mtp_kv->type, n_embd_head_k),
+                                                   ggml_row_size(mtp_kv->type, n_embd_head_qk_nope));
+            cb(mtp_k_pe, "mtp_k_pe", il);
+
+            mtp_q_pe = ggml_rope_ext(ctx0, mtp_q_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
+                                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(mtp_q_pe, "mtp_q_pe_rope", il);
+
+            mtp_k_pe = ggml_rope_ext(ctx0, mtp_k_pe, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig,
+                                     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(mtp_k_pe, "mtp_k_pe_rope", il);
+
+            ggml_tensor * mtp_Qcur = ggml_concat(ctx0, mtp_q_nope, mtp_q_pe, 0);
+            cb(mtp_Qcur, "mtp_Qcur", il);
+
+            ggml_tensor * mtp_Kcur = ggml_concat(ctx0, mtp_k_nope, mtp_k_pe, 0);
+            cb(mtp_Kcur, "mtp_Kcur", il);
+
+            ggml_tensor * mtp_Vcur = ggml_reshape_3d(ctx0, mtp_kv, n_embd_head_k, 1, n_tokens);
+            cb(mtp_Vcur, "mtp_Vcur", il);
+
+            // MTP attention: standard path only (MTP layers are decode-time, no compression)
+            ggml_tensor * mtp_attn_out = build_attn(inp_attn_kv,
+                        nullptr, NULL, nullptr,
+                        mtp_Qcur, mtp_Kcur, mtp_Vcur, nullptr,
+                        layer.attn_sinks, nullptr, kq_scale, il);
+            cb(mtp_attn_out, "mtp_attn_out", il);
+
+            mtp_cur = mtp_attn_out;
+
+            // MTP output projection (grouped low-rank)
+            if (layer.attn_o_a && layer.attn_o_b) {
+                ggml_tensor * o_grouped = ggml_reshape_3d(ctx0, mtp_cur,
+                    n_head * n_embd_head_v / o_groups, o_groups, n_tokens);
+                cb(o_grouped, "mtp_o_grouped", il);
+
+                ggml_tensor * o_mid = ggml_mul_mat(ctx0, layer.attn_o_a, o_grouped);
+                cb(o_mid, "mtp_attn_o_a", il);
+
+                o_mid = ggml_reshape_2d(ctx0, o_mid, o_groups * o_lora_rank, n_tokens);
+                cb(o_mid, "mtp_attn_o_a_flat", il);
+
+                mtp_cur = ggml_mul_mat(ctx0, layer.attn_o_b, o_mid);
+                cb(mtp_cur, "mtp_attn_o_b", il);
+            } else if (layer.wo) {
+                mtp_cur = ggml_mul_mat(ctx0, layer.wo, mtp_cur);
+                cb(mtp_cur, "mtp_attn_wo", il);
+            }
+
+            // MTP Attention residual: hc_post
+            ggml_tensor * mtp_ffn_inp;
+            mtp_cur = build_hc_post(ctx0, mtp_cur, mtp_inpSA, post_attn, comb_attn);
+            cb(mtp_cur, "mtp_hc_post_attn", il);
+            mtp_ffn_inp = mtp_cur;
+
+            // === MTP FFN: hc_pre ===
+            ggml_tensor * post_ffn = nullptr;
+            ggml_tensor * comb_ffn = nullptr;
+
+            mtp_cur = build_hc_pre(ctx0, mtp_ffn_inp, layer.hc_ffn_fn, layer.hc_ffn_base,
+                                   layer.hc_ffn_scale, hc_mult, sinkhorn_iters, hc_eps, norm_rms_eps,
+                                   post_ffn, comb_ffn);
+            cb(mtp_cur, "mtp_hc_pre_ffn", il);
+
+            // MTP FFN: dense or MoE (MTP layers use standard routing, not hash-based)
+            if (!layer.ffn_gate_inp) {
+                mtp_cur = build_ffn(mtp_cur,
+                    layer.ffn_up, NULL, NULL,
+                    layer.ffn_gate, NULL, NULL,
+                    layer.ffn_down, NULL, NULL,
+                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                cb(mtp_cur, "mtp_ffn_out", il);
+            } else {
+                ggml_tensor * moe_out = build_moe_ffn(mtp_cur,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps,
+                    layer.ffn_gate_exps,
+                    layer.ffn_down_exps,
+                    layer.ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    layer.ffn_gate_up_exps);
+                cb(moe_out, "mtp_ffn_moe_out", il);
+
+                if (layer.ffn_gate_shexp) {
+                    ggml_tensor * ffn_shexp =
+                        build_ffn(mtp_cur,
+                            layer.ffn_up_shexp, NULL, NULL,
+                            layer.ffn_gate_shexp, NULL, NULL,
+                            layer.ffn_down_shexp, NULL, NULL,
+                            NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    cb(ffn_shexp, "mtp_ffn_shexp", il);
+
+                    mtp_cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                    cb(mtp_cur, "mtp_ffn_out", il);
+                } else {
+                    mtp_cur = moe_out;
+                }
+            }
+
+            // MTP FFN residual: hc_post
+            mtp_cur = build_hc_post(ctx0, mtp_cur, mtp_ffn_inp, post_ffn, comb_ffn);
+            cb(mtp_cur, "mtp_hc_post_ffn", il);
+
+            // === MTP Head: HC head + shared_head_norm + shared_head output ===
+            // Save the hidden state (HC format) for potential chained MTP layers
+            ggml_tensor * mtp_hidden = mtp_cur;
+
+            if (nextn.hc_head_fn && nextn.hc_head_base && nextn.hc_head_scale) {
+                mtp_cur = build_hc_head(ctx0, mtp_cur, nextn.hc_head_fn, nextn.hc_head_base, nextn.hc_head_scale,
+                                       hc_mult, hc_eps, norm_rms_eps);
+                cb(mtp_cur, "mtp_hc_head", il);
+            }
+
+            if (nextn.shared_head_norm) {
+                mtp_cur = build_norm(mtp_cur, nextn.shared_head_norm, NULL, LLM_NORM_RMS, il);
+                cb(mtp_cur, "mtp_head_norm", il);
+            }
+
+            if (nextn.shared_head_head) {
+                mtp_cur = ggml_mul_mat(ctx0, nextn.shared_head_head, mtp_cur);
+                cb(mtp_cur, "mtp_logits", il);
+            }
+
+            // Expand MTP logits into forward graph
+            ggml_build_forward_expand(gf, mtp_cur);
+
+            // Pass hidden state (not logits) to next MTP layer if chained
+            mtp_inp = mtp_hidden;
+        }
+    }
 }
