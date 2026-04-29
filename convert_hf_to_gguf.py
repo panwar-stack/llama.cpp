@@ -296,12 +296,39 @@ class ModelBase:
                 return data / scale.float()
 
             def dequant_simple(weight: Tensor, scale: Tensor, block_size: Sequence[int] | None = None) -> Tensor:
-                scale = scale.float()
+                def fp8_e4m3fn_to_float(t: Tensor) -> Tensor:
+                    weight_i = t.to(torch.int16)
+                    exponent = (weight_i >> 3) & 0x0f
+                    mantissa = weight_i & 0x07
+                    exponent_f = exponent.float()
+                    mantissa_f = mantissa.float()
+                    one = torch.ones_like(mantissa_f)
+                    two = torch.full_like(mantissa_f, 2.0)
+                    seven = torch.full_like(mantissa_f, 7.0)
+                    eight = torch.full_like(mantissa_f, 8.0)
+                    min_normal = torch.full_like(mantissa_f, 2.0**-6)
+                    base = torch.full_like(exponent_f, 2.0)
+                    sign = one - two * ((weight_i & 0x80) != 0).float()
+                    return torch.where(
+                        exponent == 0,
+                        (mantissa_f / eight) * min_normal,
+                        (one + mantissa_f / eight) * torch.pow(base, exponent_f - seven),
+                    ) * sign
+
+                def fp8_e8m0_to_float(t: Tensor) -> Tensor:
+                    exponent = t.float()
+                    return torch.pow(torch.full_like(exponent, 2.0), exponent - torch.full_like(exponent, 127.0))
+
+                scale = fp8_e8m0_to_float(scale) if scale.dtype == torch.uint8 and not isinstance(scale, LazyTorchTensor) else scale.float()
+
+                if weight.dtype == torch.uint8 and not isinstance(weight, LazyTorchTensor):
+                    weight = fp8_e4m3fn_to_float(weight)
 
                 if block_size is not None:
                     dim_offset = scale.ndim - len(block_size)
                     for i, size in enumerate(block_size):
-                        scale = scale.repeat_interleave(size, dim_offset + i)
+                        dim = dim_offset + i
+                        scale = scale.repeat_interleave(size, dim, output_size=scale.shape[dim] * size)
                     # unpad the scale (e.g. when the tensor size isn't a multiple of the block size)
                     scale = scale[tuple(slice(0, size) for size in weight.shape)]
 
@@ -13422,6 +13449,24 @@ class DotsOCRVisionModel(MmprojModel):
 ###### CONVERSION LOGIC ######
 
 
+def _optional_torch_dtype_map(*items: tuple[str, type]) -> dict[torch.dtype, type]:
+    result: dict[torch.dtype, type] = {}
+    for dtype_name, np_dtype in items:
+        torch_dtype = getattr(torch, dtype_name, None)
+        if torch_dtype is not None:
+            result[torch_dtype] = np_dtype
+    return result
+
+
+def _optional_torch_dtype_str_map(*items: tuple[str, str]) -> dict[str, torch.dtype]:
+    result: dict[str, torch.dtype] = {}
+    for safetensors_name, dtype_name in items:
+        torch_dtype = getattr(torch, dtype_name, None)
+        if torch_dtype is not None:
+            result[safetensors_name] = torch_dtype
+    return result
+
+
 # tree of lazy tensors
 class LazyTorchTensor(gguf.LazyBase):
     _tensor_type = torch.Tensor
@@ -13433,7 +13478,17 @@ class LazyTorchTensor(gguf.LazyBase):
     _dtype_map: dict[torch.dtype, type] = {
         torch.float16: np.float16,
         torch.float32: np.float32,
+        torch.int64: np.int64,
+        torch.int32: np.int32,
+        torch.int16: np.int16,
+        torch.int8: np.int8,
         torch.uint8: np.uint8,
+        torch.bool: np.bool_,
+        **_optional_torch_dtype_map(
+            ("uint64", np.uint64),
+            ("uint32", np.uint32),
+            ("uint16", np.uint16),
+        ),
     }
 
     # only used when byteswapping data. Only correct size is needed
@@ -13443,16 +13498,18 @@ class LazyTorchTensor(gguf.LazyBase):
         torch.bfloat16: np.float16,
         torch.float16: np.float16,
         torch.int64: np.int64,
-        torch.uint64: np.uint64,
         torch.int32: np.int32,
-        torch.uint32: np.uint32,
         torch.int16: np.int16,
-        torch.uint16: np.uint16,
         torch.int8: np.int8,
         torch.uint8: np.uint8,
         torch.bool: np.uint8,
-        torch.float8_e4m3fn: np.uint8,
-        torch.float8_e5m2: np.uint8,
+        **_optional_torch_dtype_map(
+            ("uint64", np.uint64),
+            ("uint32", np.uint32),
+            ("uint16", np.uint16),
+            ("float8_e4m3fn", np.uint8),
+            ("float8_e5m2", np.uint8),
+        ),
     }
 
     # used for safetensors slices
@@ -13472,9 +13529,30 @@ class LazyTorchTensor(gguf.LazyBase):
         "U8": torch.uint8,
         "I8": torch.int8,
         "BOOL": torch.bool,
-        "F8_E4M3": torch.float8_e4m3fn,
-        "F8_E5M2": torch.float8_e5m2,
+        "F8_E4M3": getattr(torch, "float8_e4m3fn", torch.uint8),
+        "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
+        **_optional_torch_dtype_str_map(
+            ("F8_E5M2", "float8_e5m2"),
+        ),
     }
+
+    @staticmethod
+    def _fp8_e4m3fn_to_float(t: Tensor) -> Tensor:
+        weight_i = t.to(torch.int16)
+        sign = 1.0 - 2.0 * ((weight_i & 0x80) != 0).float()
+        exponent = (weight_i >> 3) & 0x0f
+        mantissa = weight_i & 0x07
+        exponent_f = exponent.float()
+        mantissa_f = mantissa.float()
+        return torch.where(
+            exponent == 0,
+            (mantissa_f / 8.0) * 2.0**-6,
+            (1.0 + mantissa_f / 8.0) * torch.pow(2.0, exponent_f - 7.0),
+        ) * sign
+
+    @staticmethod
+    def _fp8_e8m0_to_float(t: Tensor) -> Tensor:
+        return torch.pow(2.0, t.float() - 127.0)
 
     def numpy(self) -> gguf.LazyNumpyTensor:
         dtype = self._dtype_map[self.dtype]
@@ -13505,8 +13583,15 @@ class LazyTorchTensor(gguf.LazyBase):
                 return tensor
             dtype = cls._dtype_str_map[tensor.dtype]
             numpy_dtype = cls._dtype_byteswap_map[dtype]
-            return torch.from_numpy(byteswap_tensor(tensor.mmap_bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
+            data = torch.from_numpy(byteswap_tensor(tensor.mmap_bytes(), numpy_dtype)).view(dtype).reshape(tensor.shape)
+            if tensor.dtype == "F8_E4M3" and dtype == torch.uint8:
+                return cls._fp8_e4m3fn_to_float(data)
+            if tensor.dtype == "F8_E8M0" and dtype == torch.uint8:
+                return cls._fp8_e8m0_to_float(data)
+            return data
         dtype = cls._dtype_str_map[t.dtype]
+        if t.dtype in {"F8_E4M3", "F8_E8M0"} and dtype == torch.uint8:
+            dtype = torch.float32
         shape = t.shape
         lazy = cls(meta=cls.meta_with_dtype_and_shape(dtype, shape), args=(t,), func=lambda r: load_tensor(r))
         return cast(torch.Tensor, lazy)
@@ -13521,8 +13606,16 @@ class LazyTorchTensor(gguf.LazyBase):
         dtype = cls._dtype_str_map[remote_tensor.dtype]
         numpy_dtype = cls._dtype_byteswap_map[dtype]
         shape = remote_tensor.shape
-        meta = cls.meta_with_dtype_and_shape(dtype, shape)
-        lazy = cls(meta=meta, args=(remote_tensor,), func=lambda r: torch.from_numpy(byteswap_tensor(np.frombuffer(r.data(), dtype=numpy_dtype), numpy_dtype)).view(dtype).reshape(shape))
+        meta_dtype = torch.float32 if remote_tensor.dtype in {"F8_E4M3", "F8_E8M0"} and dtype == torch.uint8 else dtype
+        meta = cls.meta_with_dtype_and_shape(meta_dtype, shape)
+        def load_tensor(r):
+            data = torch.from_numpy(byteswap_tensor(np.frombuffer(r.data(), dtype=numpy_dtype), numpy_dtype)).view(dtype).reshape(shape)
+            if r.dtype == "F8_E4M3" and dtype == torch.uint8:
+                return cls._fp8_e4m3fn_to_float(data)
+            if r.dtype == "F8_E8M0" and dtype == torch.uint8:
+                return cls._fp8_e8m0_to_float(data)
+            return data
+        lazy = cls(meta=meta, args=(remote_tensor,), func=load_tensor)
         return cast(torch.Tensor, lazy)
 
     @classmethod

@@ -1378,6 +1378,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * probs = nullptr;
     ggml_tensor * selected_experts = selected_experts_in;
 
+    // cast pre-selected experts to I32 if provided by hash-routing path
+    if (selected_experts_in && selected_experts_in->type != GGML_TYPE_I32) {
+        selected_experts = ggml_cast(ctx0, selected_experts_in, GGML_TYPE_I32);
+    }
+
     if (selected_experts_in == nullptr) {
         ggml_tensor * logits = nullptr;
 
